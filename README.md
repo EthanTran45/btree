@@ -45,7 +45,12 @@ if (tree.search(10)) {
 
 // Check if empty
 if (!tree.empty()) {
-    std::cout << "Tree has elements" << std::endl;
+    std::cout << "Size: " << tree.size() << std::endl;
+}
+
+// Remove values
+if (tree.remove(20)) {
+    std::cout << "Removed 20" << std::endl;
 }
 
 // Print all values in order
@@ -55,6 +60,9 @@ tree.traverse();
 BTree<std::string, 5> string_tree;
 string_tree.insert("apple");
 string_tree.insert("banana");
+
+// Move semantics (copy is disabled)
+BTree<int> tree2 = std::move(tree);  // tree is now empty
 ```
 
 ## Running Tests
@@ -65,14 +73,45 @@ Compile and run the test suite:
 g++ -std=c++17 -Wall -Wextra -o btree_test btree_test.cpp && ./btree_test
 ```
 
-The test suite includes 19 tests covering:
-- Basic operations (insert, search, empty)
-- Sorted and reverse-sorted insertions
-- Random order insertions
+The test suite includes 44 tests organized into the following categories:
+
+### Basic Operations (19 tests)
+- Empty tree behavior and state transitions
+- Single and multiple insertions
+- Sorted, reverse-sorted, and random order insertions
+- Search for existing and non-existing keys
 - Different data types (int, string, double)
-- Different tree orders (3, 5, 10)
-- Edge cases (duplicates, negative values, INT_MIN/INT_MAX)
-- Stress testing with 1000 elements
+- Different tree orders (3, 5, 10, 50)
+- Boundary values (INT_MIN, INT_MAX)
+- Traverse output verification
+
+### Remove Operations (10 tests)
+- Basic removal and size updates
+- Removing non-existent keys (returns false)
+- Removing from empty tree
+- Removing all elements until empty
+- Rebalancing with borrow from siblings
+- Cascade merging when nodes underflow
+- Removing in reverse order
+
+### Move Semantics (2 tests)
+- Move constructor transfers ownership
+- Move assignment cleans up existing data
+
+### Edge Cases (13 tests)
+- Remove single-element tree
+- Remove minimum/maximum elements repeatedly
+- Re-insert after removal
+- Alternating insert and remove operations
+- Remove middle elements (internal node operations)
+- Remove same element twice
+- Minimum order (Order=3) stress test
+- Large order (Order=50) with 1000 elements
+- Insert after tree has been emptied
+- Empty string and similar prefix handling
+- Size consistency after failed operations
+- Interleaved stress test (500 inserts, 250 removes)
+- Random operations validated against std::set
 
 ## API Reference
 
