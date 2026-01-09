@@ -1,5 +1,8 @@
 #include <iostream>
 #include <vector>
+#include <stack>
+#include <stdexcept>
+#include <functional>
 
 template <typename T, int Order = 3>
 class BTree {
@@ -22,6 +25,94 @@ private:
     size_t size_;
     static constexpr int max_keys = Order - 1;
     static constexpr int min_keys = (Order - 1) / 2;
+
+public:
+    // Forward iterator for in-order traversal
+    class iterator {
+    private:
+        struct StackFrame {
+            Node* node;
+            int index;  // Next key index to visit
+        };
+        std::stack<StackFrame> stack_;
+        const T* current_;
+
+        void push_left_path(Node* node) {
+            while (node != nullptr) {
+                stack_.push({node, 0});
+                if (node->is_leaf) {
+                    break;
+                }
+                node = node->children[0];
+            }
+        }
+
+        void advance() {
+            if (stack_.empty()) {
+                current_ = nullptr;
+                return;
+            }
+
+            StackFrame& frame = stack_.top();
+
+            if (frame.index < static_cast<int>(frame.node->keys.size())) {
+                current_ = &frame.node->keys[frame.index];
+                frame.index++;
+
+                // If not a leaf, go to right child of current key
+                if (!frame.node->is_leaf && frame.index < static_cast<int>(frame.node->children.size())) {
+                    Node* right_child = frame.node->children[frame.index];
+                    push_left_path(right_child);
+                }
+            } else {
+                // Done with this node, go back up
+                stack_.pop();
+                advance();
+            }
+        }
+
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = T;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const T*;
+        using reference = const T&;
+
+        iterator() : current_(nullptr) {}
+
+        explicit iterator(Node* root) : current_(nullptr) {
+            if (root != nullptr) {
+                push_left_path(root);
+                advance();
+            }
+        }
+
+        reference operator*() const { return *current_; }
+        pointer operator->() const { return current_; }
+
+        iterator& operator++() {
+            advance();
+            return *this;
+        }
+
+        iterator operator++(int) {
+            iterator tmp = *this;
+            advance();
+            return tmp;
+        }
+
+        bool operator==(const iterator& other) const {
+            return current_ == other.current_;
+        }
+
+        bool operator!=(const iterator& other) const {
+            return current_ != other.current_;
+        }
+    };
+
+    using const_iterator = iterator;  // All iterators are const (keys are immutable)
+
+private:
 
     void split_child(Node* parent, int index) {
         Node* full_child = parent->children[index];
@@ -96,6 +187,45 @@ private:
 
         if (!node->is_leaf) {
             traverse_node(node->children[i]);
+        }
+    }
+
+    void traverse_node(Node* node, std::ostream& os) const {
+        int i;
+        for (i = 0; i < static_cast<int>(node->keys.size()); i++) {
+            if (!node->is_leaf) {
+                traverse_node(node->children[i], os);
+            }
+            os << node->keys[i] << " ";
+        }
+
+        if (!node->is_leaf) {
+            traverse_node(node->children[i], os);
+        }
+    }
+
+    size_t calculate_height(Node* node) const noexcept {
+        if (node == nullptr) {
+            return 0;
+        }
+        if (node->is_leaf) {
+            return 1;
+        }
+        return 1 + calculate_height(node->children[0]);
+    }
+
+    template<typename Func>
+    void for_each_node(Node* node, Func& f) const {
+        int i;
+        for (i = 0; i < static_cast<int>(node->keys.size()); i++) {
+            if (!node->is_leaf) {
+                for_each_node(node->children[i], f);
+            }
+            f(node->keys[i]);
+        }
+
+        if (!node->is_leaf) {
+            for_each_node(node->children[i], f);
         }
     }
 
@@ -320,11 +450,15 @@ public:
         return removed;
     }
 
-    bool search(const T& key) const {
+    [[nodiscard]] bool search(const T& key) const noexcept {
         if (root == nullptr) {
             return false;
         }
         return search_node(root, key) != nullptr;
+    }
+
+    [[nodiscard]] bool contains(const T& key) const noexcept {
+        return search(key);
     }
 
     void traverse() const {
@@ -334,11 +468,83 @@ public:
         }
     }
 
-    bool empty() const {
+    void traverse(std::ostream& os) const {
+        if (root != nullptr) {
+            traverse_node(root, os);
+            os << std::endl;
+        }
+    }
+
+    [[nodiscard]] bool empty() const noexcept {
         return root == nullptr;
     }
 
-    size_t size() const {
+    [[nodiscard]] size_t size() const noexcept {
         return size_;
+    }
+
+    void clear() noexcept {
+        delete root;
+        root = nullptr;
+        size_ = 0;
+    }
+
+    [[nodiscard]] size_t height() const noexcept {
+        return calculate_height(root);
+    }
+
+    [[nodiscard]] const T& min() const {
+        if (root == nullptr) {
+            throw std::runtime_error("min() called on empty tree");
+        }
+        Node* node = root;
+        while (!node->is_leaf) {
+            node = node->children[0];
+        }
+        return node->keys[0];
+    }
+
+    [[nodiscard]] const T& max() const {
+        if (root == nullptr) {
+            throw std::runtime_error("max() called on empty tree");
+        }
+        Node* node = root;
+        while (!node->is_leaf) {
+            node = node->children[node->children.size() - 1];
+        }
+        return node->keys[node->keys.size() - 1];
+    }
+
+    template<typename Func>
+    void for_each(Func f) const {
+        if (root != nullptr) {
+            for_each_node(root, f);
+        }
+    }
+
+    [[nodiscard]] std::vector<T> to_vector() const {
+        std::vector<T> result;
+        result.reserve(size_);
+        for_each([&result](const T& key) {
+            result.push_back(key);
+        });
+        return result;
+    }
+
+    // Iterator support
+    [[nodiscard]] iterator begin() const {
+        return iterator(root);
+    }
+
+    [[nodiscard]] iterator end() const {
+        return iterator();
+    }
+
+    [[nodiscard]] const_iterator cbegin() const {
+        return begin();
+    }
+
+    [[nodiscard]] const_iterator cend() const {
+        return end();
     }
 };

@@ -767,6 +767,286 @@ TEST(test_random_operations_integrity) {
     }
 }
 
+// === NEW API TESTS ===
+
+// Test: contains() method (alias for search)
+TEST(test_contains) {
+    BTree<int> tree;
+    tree.insert(10);
+    tree.insert(20);
+
+    ASSERT_TRUE(tree.contains(10));
+    ASSERT_TRUE(tree.contains(20));
+    ASSERT_FALSE(tree.contains(30));
+}
+
+// Test: clear() method
+TEST(test_clear) {
+    BTree<int> tree;
+    for (int i = 0; i < 50; i++) {
+        tree.insert(i);
+    }
+
+    ASSERT_EQ(tree.size(), 50u);
+    ASSERT_FALSE(tree.empty());
+
+    tree.clear();
+
+    ASSERT_EQ(tree.size(), 0u);
+    ASSERT_TRUE(tree.empty());
+    ASSERT_FALSE(tree.contains(25));
+
+    // Should work normally after clear
+    tree.insert(100);
+    ASSERT_EQ(tree.size(), 1u);
+    ASSERT_TRUE(tree.contains(100));
+}
+
+// Test: height() method
+TEST(test_height) {
+    BTree<int, 3> tree;  // Order 3: max 2 keys per node
+
+    ASSERT_EQ(tree.height(), 0u);  // Empty tree
+
+    tree.insert(10);
+    ASSERT_EQ(tree.height(), 1u);  // Single node
+
+    // Insert more to force splits and increase height
+    for (int i = 0; i < 20; i++) {
+        tree.insert(i);
+    }
+    ASSERT_TRUE(tree.height() >= 2u);  // Should have multiple levels
+}
+
+// Test: min() method
+TEST(test_min) {
+    BTree<int> tree;
+
+    // Test exception on empty tree
+    bool threw = false;
+    try {
+        (void)tree.min();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    ASSERT_TRUE(threw);
+
+    tree.insert(50);
+    tree.insert(30);
+    tree.insert(70);
+    tree.insert(10);
+    tree.insert(90);
+
+    ASSERT_EQ(tree.min(), 10);
+
+    tree.remove(10);
+    ASSERT_EQ(tree.min(), 30);
+}
+
+// Test: max() method
+TEST(test_max) {
+    BTree<int> tree;
+
+    // Test exception on empty tree
+    bool threw = false;
+    try {
+        (void)tree.max();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    ASSERT_TRUE(threw);
+
+    tree.insert(50);
+    tree.insert(30);
+    tree.insert(70);
+    tree.insert(10);
+    tree.insert(90);
+
+    ASSERT_EQ(tree.max(), 90);
+
+    tree.remove(90);
+    ASSERT_EQ(tree.max(), 70);
+}
+
+// Test: for_each() method
+TEST(test_for_each) {
+    BTree<int> tree;
+    tree.insert(30);
+    tree.insert(10);
+    tree.insert(20);
+    tree.insert(40);
+
+    std::vector<int> collected;
+    tree.for_each([&collected](int val) {
+        collected.push_back(val);
+    });
+
+    ASSERT_EQ(collected.size(), 4u);
+    // Should be in sorted order
+    ASSERT_EQ(collected[0], 10);
+    ASSERT_EQ(collected[1], 20);
+    ASSERT_EQ(collected[2], 30);
+    ASSERT_EQ(collected[3], 40);
+}
+
+// Test: to_vector() method
+TEST(test_to_vector) {
+    BTree<int> tree;
+    tree.insert(50);
+    tree.insert(25);
+    tree.insert(75);
+    tree.insert(10);
+    tree.insert(30);
+
+    std::vector<int> vec = tree.to_vector();
+
+    ASSERT_EQ(vec.size(), 5u);
+    // Should be sorted
+    ASSERT_EQ(vec[0], 10);
+    ASSERT_EQ(vec[1], 25);
+    ASSERT_EQ(vec[2], 30);
+    ASSERT_EQ(vec[3], 50);
+    ASSERT_EQ(vec[4], 75);
+}
+
+// Test: Iterator basic usage
+TEST(test_iterator_basic) {
+    BTree<int> tree;
+    tree.insert(30);
+    tree.insert(10);
+    tree.insert(20);
+
+    std::vector<int> collected;
+    for (auto it = tree.begin(); it != tree.end(); ++it) {
+        collected.push_back(*it);
+    }
+
+    ASSERT_EQ(collected.size(), 3u);
+    ASSERT_EQ(collected[0], 10);
+    ASSERT_EQ(collected[1], 20);
+    ASSERT_EQ(collected[2], 30);
+}
+
+// Test: Range-based for loop
+TEST(test_range_based_for) {
+    BTree<int> tree;
+    tree.insert(5);
+    tree.insert(3);
+    tree.insert(7);
+    tree.insert(1);
+    tree.insert(9);
+
+    std::vector<int> collected;
+    for (const auto& val : tree) {
+        collected.push_back(val);
+    }
+
+    ASSERT_EQ(collected.size(), 5u);
+    ASSERT_EQ(collected[0], 1);
+    ASSERT_EQ(collected[1], 3);
+    ASSERT_EQ(collected[2], 5);
+    ASSERT_EQ(collected[3], 7);
+    ASSERT_EQ(collected[4], 9);
+}
+
+// Test: Iterator with large tree
+TEST(test_iterator_large) {
+    BTree<int, 4> tree;
+
+    for (int i = 99; i >= 0; i--) {
+        tree.insert(i);
+    }
+
+    int expected = 0;
+    for (const auto& val : tree) {
+        ASSERT_EQ(val, expected);
+        expected++;
+    }
+    ASSERT_EQ(expected, 100);
+}
+
+// Test: Iterator on empty tree
+TEST(test_iterator_empty) {
+    BTree<int> tree;
+
+    int count = 0;
+    for (const auto& val : tree) {
+        (void)val;
+        count++;
+    }
+    ASSERT_EQ(count, 0);
+
+    ASSERT_TRUE(tree.begin() == tree.end());
+}
+
+// Test: cbegin/cend
+TEST(test_const_iterators) {
+    BTree<int> tree;
+    tree.insert(1);
+    tree.insert(2);
+    tree.insert(3);
+
+    std::vector<int> collected;
+    for (auto it = tree.cbegin(); it != tree.cend(); ++it) {
+        collected.push_back(*it);
+    }
+
+    ASSERT_EQ(collected.size(), 3u);
+}
+
+// Test: traverse with custom ostream
+TEST(test_traverse_ostream) {
+    BTree<int> tree;
+    tree.insert(30);
+    tree.insert(10);
+    tree.insert(20);
+
+    std::stringstream ss;
+    tree.traverse(ss);
+
+    std::string output = ss.str();
+    ASSERT_TRUE(output.find("10") != std::string::npos);
+    ASSERT_TRUE(output.find("20") != std::string::npos);
+    ASSERT_TRUE(output.find("30") != std::string::npos);
+}
+
+// Test: Iterator post-increment
+TEST(test_iterator_post_increment) {
+    BTree<int> tree;
+    tree.insert(10);
+    tree.insert(20);
+
+    auto it = tree.begin();
+    auto old = it++;
+
+    ASSERT_EQ(*old, 10);
+    ASSERT_EQ(*it, 20);
+}
+
+// Test: STL algorithm compatibility
+TEST(test_stl_algorithms) {
+    BTree<int> tree;
+    for (int i = 1; i <= 10; i++) {
+        tree.insert(i);
+    }
+
+    // std::find
+    auto it = std::find(tree.begin(), tree.end(), 5);
+    ASSERT_TRUE(it != tree.end());
+    ASSERT_EQ(*it, 5);
+
+    // std::count
+    int count = std::count(tree.begin(), tree.end(), 7);
+    ASSERT_EQ(count, 1);
+
+    // std::accumulate (requires numeric header but we can do manual sum)
+    int sum = 0;
+    for (const auto& val : tree) {
+        sum += val;
+    }
+    ASSERT_EQ(sum, 55);  // 1+2+...+10
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -816,6 +1096,23 @@ int main() {
     RUN_TEST(test_size_consistency);
     RUN_TEST(test_interleaved_stress);
     RUN_TEST(test_random_operations_integrity);
+
+    // New API tests
+    RUN_TEST(test_contains);
+    RUN_TEST(test_clear);
+    RUN_TEST(test_height);
+    RUN_TEST(test_min);
+    RUN_TEST(test_max);
+    RUN_TEST(test_for_each);
+    RUN_TEST(test_to_vector);
+    RUN_TEST(test_iterator_basic);
+    RUN_TEST(test_range_based_for);
+    RUN_TEST(test_iterator_large);
+    RUN_TEST(test_iterator_empty);
+    RUN_TEST(test_const_iterators);
+    RUN_TEST(test_traverse_ostream);
+    RUN_TEST(test_iterator_post_increment);
+    RUN_TEST(test_stl_algorithms);
 
     std::cout << std::endl;
     std::cout << "=== Results ===" << std::endl;
