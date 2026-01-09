@@ -1,6 +1,5 @@
 #include <iostream>
 #include <vector>
-#include <algorithm>
 
 template <typename T, int Order = 3>
 class BTree {
@@ -20,6 +19,7 @@ private:
     };
 
     Node* root;
+    size_t size_;
     static constexpr int max_keys = Order - 1;
     static constexpr int min_keys = (Order - 1) / 2;
 
@@ -99,17 +99,188 @@ private:
         }
     }
 
+    T get_predecessor(Node* node) {
+        while (!node->is_leaf) {
+            node = node->children[node->children.size() - 1];
+        }
+        return node->keys[node->keys.size() - 1];
+    }
+
+    T get_successor(Node* node) {
+        while (!node->is_leaf) {
+            node = node->children[0];
+        }
+        return node->keys[0];
+    }
+
+    void merge_children(Node* node, int idx) {
+        Node* left = node->children[idx];
+        Node* right = node->children[idx + 1];
+
+        // Move key from parent to left child
+        left->keys.push_back(node->keys[idx]);
+
+        // Move all keys from right to left
+        for (const T& key : right->keys) {
+            left->keys.push_back(key);
+        }
+
+        // Move all children from right to left
+        for (Node* child : right->children) {
+            left->children.push_back(child);
+        }
+
+        // Remove key from parent
+        node->keys.erase(node->keys.begin() + idx);
+        node->children.erase(node->children.begin() + idx + 1);
+
+        // Delete right node (but not its children, as they're now in left)
+        right->children.clear();
+        delete right;
+    }
+
+    void fill_child(Node* node, int idx) {
+        // Try to borrow from left sibling
+        if (idx > 0 && static_cast<int>(node->children[idx - 1]->keys.size()) > min_keys) {
+            borrow_from_prev(node, idx);
+        }
+        // Try to borrow from right sibling
+        else if (idx < static_cast<int>(node->children.size()) - 1 &&
+                 static_cast<int>(node->children[idx + 1]->keys.size()) > min_keys) {
+            borrow_from_next(node, idx);
+        }
+        // Merge with a sibling
+        else {
+            if (idx < static_cast<int>(node->children.size()) - 1) {
+                merge_children(node, idx);
+            } else {
+                merge_children(node, idx - 1);
+            }
+        }
+    }
+
+    void borrow_from_prev(Node* node, int idx) {
+        Node* child = node->children[idx];
+        Node* sibling = node->children[idx - 1];
+
+        // Shift all keys in child one step ahead
+        child->keys.insert(child->keys.begin(), node->keys[idx - 1]);
+
+        // Move key from sibling to parent
+        node->keys[idx - 1] = sibling->keys.back();
+        sibling->keys.pop_back();
+
+        // Move child pointer if not leaf
+        if (!child->is_leaf) {
+            child->children.insert(child->children.begin(), sibling->children.back());
+            sibling->children.pop_back();
+        }
+    }
+
+    void borrow_from_next(Node* node, int idx) {
+        Node* child = node->children[idx];
+        Node* sibling = node->children[idx + 1];
+
+        // Move key from parent to child
+        child->keys.push_back(node->keys[idx]);
+
+        // Move key from sibling to parent
+        node->keys[idx] = sibling->keys[0];
+        sibling->keys.erase(sibling->keys.begin());
+
+        // Move child pointer if not leaf
+        if (!child->is_leaf) {
+            child->children.push_back(sibling->children[0]);
+            sibling->children.erase(sibling->children.begin());
+        }
+    }
+
+    bool remove_from_node(Node* node, const T& key) {
+        int idx = 0;
+        while (idx < static_cast<int>(node->keys.size()) && node->keys[idx] < key) {
+            idx++;
+        }
+
+        // Key found in this node
+        if (idx < static_cast<int>(node->keys.size()) && node->keys[idx] == key) {
+            if (node->is_leaf) {
+                // Case 1: Key is in leaf node - simply remove it
+                node->keys.erase(node->keys.begin() + idx);
+                return true;
+            } else {
+                // Case 2: Key is in internal node
+                if (static_cast<int>(node->children[idx]->keys.size()) > min_keys) {
+                    // Case 2a: Left child has enough keys
+                    T pred = get_predecessor(node->children[idx]);
+                    node->keys[idx] = pred;
+                    return remove_from_node(node->children[idx], pred);
+                } else if (static_cast<int>(node->children[idx + 1]->keys.size()) > min_keys) {
+                    // Case 2b: Right child has enough keys
+                    T succ = get_successor(node->children[idx + 1]);
+                    node->keys[idx] = succ;
+                    return remove_from_node(node->children[idx + 1], succ);
+                } else {
+                    // Case 2c: Both children have minimum keys - merge them
+                    merge_children(node, idx);
+                    return remove_from_node(node->children[idx], key);
+                }
+            }
+        } else {
+            // Key not in this node
+            if (node->is_leaf) {
+                return false;  // Key not found
+            }
+
+            bool is_last = (idx == static_cast<int>(node->keys.size()));
+
+            // Ensure child has enough keys before descending
+            if (static_cast<int>(node->children[idx]->keys.size()) <= min_keys) {
+                fill_child(node, idx);
+            }
+
+            // After filling, the child at idx may have been merged with previous sibling
+            if (is_last && idx > static_cast<int>(node->keys.size())) {
+                return remove_from_node(node->children[idx - 1], key);
+            } else {
+                return remove_from_node(node->children[idx], key);
+            }
+        }
+    }
+
 public:
-    BTree() : root(nullptr) {}
+    BTree() : root(nullptr), size_(0) {}
 
     ~BTree() {
         delete root;
+    }
+
+    // Prevent copying (would cause double-free)
+    BTree(const BTree&) = delete;
+    BTree& operator=(const BTree&) = delete;
+
+    // Move constructor
+    BTree(BTree&& other) noexcept : root(other.root), size_(other.size_) {
+        other.root = nullptr;
+        other.size_ = 0;
+    }
+
+    // Move assignment
+    BTree& operator=(BTree&& other) noexcept {
+        if (this != &other) {
+            delete root;
+            root = other.root;
+            size_ = other.size_;
+            other.root = nullptr;
+            other.size_ = 0;
+        }
+        return *this;
     }
 
     void insert(const T& key) {
         if (root == nullptr) {
             root = new Node(true);
             root->keys.push_back(key);
+            size_++;
             return;
         }
 
@@ -121,6 +292,32 @@ public:
         }
 
         insert_non_full(root, key);
+        size_++;
+    }
+
+    bool remove(const T& key) {
+        if (root == nullptr) {
+            return false;
+        }
+
+        bool removed = remove_from_node(root, key);
+
+        if (removed) {
+            size_--;
+            // If root has no keys left, make its first child the new root
+            if (root->keys.empty()) {
+                Node* old_root = root;
+                if (root->is_leaf) {
+                    root = nullptr;
+                } else {
+                    root = root->children[0];
+                }
+                old_root->children.clear();  // Prevent recursive deletion
+                delete old_root;
+            }
+        }
+
+        return removed;
     }
 
     bool search(const T& key) const {
@@ -139,5 +336,9 @@ public:
 
     bool empty() const {
         return root == nullptr;
+    }
+
+    size_t size() const {
+        return size_;
     }
 };

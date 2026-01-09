@@ -1,0 +1,9 @@
+# Compiled binaries
+btree
+btree_test
+
+# Object files
+*.o
+
+# Debug files
+*.dSYM/
