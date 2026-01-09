@@ -52,7 +52,6 @@ private:
                 i--;
             }
             node->keys[i + 1] = key;
-            node->keys.pop_back();
         } else {
             while (i >= 0 && key < node->keys[i]) {
                 i--;
