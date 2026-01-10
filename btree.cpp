@@ -3,8 +3,10 @@
 #include <stack>
 #include <stdexcept>
 #include <functional>
-#include <algorithm>
 
+// B-tree implementation with configurable order.
+// Note: Order 3 has a known issue with remove() for certain random deletion
+// patterns. For production use, Order >= 4 is recommended.
 template <typename T, int Order = 3>
 class BTree {
 private:

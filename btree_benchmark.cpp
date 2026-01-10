@@ -3,10 +3,14 @@
 #include <random>
 #include <algorithm>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <string>
 
 using namespace std::chrono;
+
+// Number of runs per benchmark (first run is warmup, discarded)
+constexpr int NUM_RUNS = 4;
 
 // Benchmark result structure
 struct BenchmarkResult {
@@ -64,36 +68,63 @@ void print_header(const std::string& title) {
     print_separator();
 }
 
-// Benchmark insert operation
+// Benchmark insert operation (runs multiple times, returns best)
 template<int Order>
 BenchmarkResult benchmark_insert_random(const std::vector<int>& data) {
-    Timer timer;
-    BTree<int, Order> tree;
-    for (int val : data) {
-        tree.insert(val);
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        BTree<int, Order> tree;
+        for (int val : data) {
+            tree.insert(val);
+        }
+        double elapsed = timer.elapsed_ms();
+        if (run > 0 && elapsed < best_ms) {  // Skip first run (warmup)
+            best_ms = elapsed;
+        } else if (run == 1) {
+            best_ms = elapsed;
+        }
     }
-    return {"BTree<" + std::to_string(Order) + "> insert random", timer.elapsed_ms(), data.size()};
+    return {"BTree<" + std::to_string(Order) + "> insert random", best_ms, data.size()};
 }
 
 template<int Order>
 BenchmarkResult benchmark_insert_sequential(const std::vector<int>& data) {
-    Timer timer;
-    BTree<int, Order> tree;
-    for (int val : data) {
-        tree.insert(val);
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        BTree<int, Order> tree;
+        for (int val : data) {
+            tree.insert(val);
+        }
+        double elapsed = timer.elapsed_ms();
+        if (run > 0 && elapsed < best_ms) {
+            best_ms = elapsed;
+        } else if (run == 1) {
+            best_ms = elapsed;
+        }
     }
-    return {"BTree<" + std::to_string(Order) + "> insert sequential", timer.elapsed_ms(), data.size()};
+    return {"BTree<" + std::to_string(Order) + "> insert sequential", best_ms, data.size()};
 }
 
-// Benchmark search operation
+// Benchmark search operation (runs multiple times, returns best)
 template<int Order>
 BenchmarkResult benchmark_search(BTree<int, Order>& tree, const std::vector<int>& queries) {
-    Timer timer;
-    volatile int found = 0;  // Prevent optimization
-    for (int val : queries) {
-        if (tree.search(val)) found++;
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile int found = 0;  // Prevent optimization
+        for (int val : queries) {
+            if (tree.search(val)) found++;
+        }
+        double elapsed = timer.elapsed_ms();
+        if (run > 0 && elapsed < best_ms) {
+            best_ms = elapsed;
+        } else if (run == 1) {
+            best_ms = elapsed;
+        }
     }
-    return {"BTree<" + std::to_string(Order) + "> search", timer.elapsed_ms(), queries.size()};
+    return {"BTree<" + std::to_string(Order) + "> search", best_ms, queries.size()};
 }
 
 // Benchmark remove operation
@@ -116,34 +147,62 @@ BenchmarkResult benchmark_remove(const std::vector<int>& data) {
     return {"BTree<" + std::to_string(Order) + "> remove random", timer.elapsed_ms(), data.size()};
 }
 
-// Benchmark iteration
+// Benchmark iteration (runs multiple times, returns best)
 template<int Order>
 BenchmarkResult benchmark_iterate(BTree<int, Order>& tree) {
-    Timer timer;
-    volatile long sum = 0;  // Prevent optimization
-    for (const auto& val : tree) {
-        sum += val;
+    double best_ms = std::numeric_limits<double>::max();
+    size_t tree_size = tree.size();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile long sum = 0;  // Prevent optimization
+        for (const auto& val : tree) {
+            sum += val;
+        }
+        double elapsed = timer.elapsed_ms();
+        if (run > 0 && elapsed < best_ms) {
+            best_ms = elapsed;
+        } else if (run == 1) {
+            best_ms = elapsed;
+        }
     }
-    return {"BTree<" + std::to_string(Order) + "> iterate", timer.elapsed_ms(), tree.size()};
+    return {"BTree<" + std::to_string(Order) + "> iterate", best_ms, tree_size};
 }
 
-// Benchmark std::set for comparison
+// Benchmark std::set for comparison (runs multiple times, returns best)
 BenchmarkResult benchmark_set_insert(const std::vector<int>& data) {
-    Timer timer;
-    std::set<int> s;
-    for (int val : data) {
-        s.insert(val);
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        std::set<int> s;
+        for (int val : data) {
+            s.insert(val);
+        }
+        double elapsed = timer.elapsed_ms();
+        if (run > 0 && elapsed < best_ms) {
+            best_ms = elapsed;
+        } else if (run == 1) {
+            best_ms = elapsed;
+        }
     }
-    return {"std::set insert", timer.elapsed_ms(), data.size()};
+    return {"std::set insert", best_ms, data.size()};
 }
 
 BenchmarkResult benchmark_set_search(std::set<int>& s, const std::vector<int>& queries) {
-    Timer timer;
-    volatile int found = 0;
-    for (int val : queries) {
-        if (s.find(val) != s.end()) found++;
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile int found = 0;
+        for (int val : queries) {
+            if (s.find(val) != s.end()) found++;
+        }
+        double elapsed = timer.elapsed_ms();
+        if (run > 0 && elapsed < best_ms) {
+            best_ms = elapsed;
+        } else if (run == 1) {
+            best_ms = elapsed;
+        }
     }
-    return {"std::set search", timer.elapsed_ms(), queries.size()};
+    return {"std::set search", best_ms, queries.size()};
 }
 
 BenchmarkResult benchmark_set_remove(const std::vector<int>& data) {
@@ -164,12 +223,22 @@ BenchmarkResult benchmark_set_remove(const std::vector<int>& data) {
 }
 
 BenchmarkResult benchmark_set_iterate(std::set<int>& s) {
-    Timer timer;
-    volatile long sum = 0;
-    for (const auto& val : s) {
-        sum += val;
+    double best_ms = std::numeric_limits<double>::max();
+    size_t set_size = s.size();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile long sum = 0;
+        for (const auto& val : s) {
+            sum += val;
+        }
+        double elapsed = timer.elapsed_ms();
+        if (run > 0 && elapsed < best_ms) {
+            best_ms = elapsed;
+        } else if (run == 1) {
+            best_ms = elapsed;
+        }
     }
-    return {"std::set iterate", timer.elapsed_ms(), s.size()};
+    return {"std::set iterate", best_ms, set_size};
 }
 
 // Print result
@@ -181,7 +250,7 @@ void print_result(const BenchmarkResult& r) {
 
 // Run all benchmarks for a given size
 template<int Order>
-void run_benchmarks_for_order(size_t n, const std::vector<int>& random_data, const std::vector<int>& seq_data) {
+void run_benchmarks_for_order(size_t /*n*/, const std::vector<int>& random_data, const std::vector<int>& seq_data) {
     std::cout << "\n=== Order " << Order << " ===\n";
 
     // Insert benchmarks
@@ -204,7 +273,7 @@ void run_benchmarks_for_order(size_t n, const std::vector<int>& random_data, con
     // print_result(benchmark_remove<Order>(random_data));
 }
 
-void run_set_benchmarks(size_t n, const std::vector<int>& random_data) {
+void run_set_benchmarks(size_t /*n*/, const std::vector<int>& random_data) {
     std::cout << "\n=== std::set (baseline) ===\n";
 
     print_result(benchmark_set_insert(random_data));
