@@ -3,6 +3,7 @@
 #include <stack>
 #include <stdexcept>
 #include <functional>
+#include <algorithm>
 
 template <typename T, int Order = 3>
 class BTree {
@@ -48,27 +49,25 @@ public:
         }
 
         void advance() {
-            if (stack_.empty()) {
-                current_ = nullptr;
-                return;
-            }
+            while (!stack_.empty()) {
+                StackFrame& frame = stack_.top();
 
-            StackFrame& frame = stack_.top();
+                if (frame.index < static_cast<int>(frame.node->keys.size())) {
+                    current_ = &frame.node->keys[frame.index];
+                    frame.index++;
 
-            if (frame.index < static_cast<int>(frame.node->keys.size())) {
-                current_ = &frame.node->keys[frame.index];
-                frame.index++;
-
-                // If not a leaf, go to right child of current key
-                if (!frame.node->is_leaf && frame.index < static_cast<int>(frame.node->children.size())) {
-                    Node* right_child = frame.node->children[frame.index];
-                    push_left_path(right_child);
+                    // If not a leaf, go to right child of current key
+                    if (!frame.node->is_leaf && frame.index < static_cast<int>(frame.node->children.size())) {
+                        Node* right_child = frame.node->children[frame.index];
+                        push_left_path(right_child);
+                    }
+                    return;
+                } else {
+                    // Done with this node, go back up
+                    stack_.pop();
                 }
-            } else {
-                // Done with this node, go back up
-                stack_.pop();
-                advance();
             }
+            current_ = nullptr;
         }
 
     public:
@@ -137,7 +136,8 @@ private:
         int i = node->keys.size() - 1;
 
         if (node->is_leaf) {
-            node->keys.push_back(key);
+            // Find position and insert in one pass
+            node->keys.push_back(T{});  // Make room
             while (i >= 0 && key < node->keys[i]) {
                 node->keys[i + 1] = node->keys[i];
                 i--;
@@ -267,6 +267,33 @@ private:
         // Delete right node (but not its children, as they're now in left)
         right->children.clear();
         delete right;
+
+        // For small orders (like 3), merging can cause overflow.
+        // If so, split the merged node and push a key back to parent.
+        if (static_cast<int>(left->keys.size()) > max_keys) {
+            Node* new_node = new Node(left->is_leaf);
+            // Use floor division for mid - ensures left gets at least floor(n/2) keys
+            int total_keys = left->keys.size();
+            int mid = total_keys / 2;
+
+            // Ensure both halves have at least 1 key
+            if (mid == 0) mid = 1;
+            if (mid >= total_keys - 1) mid = total_keys - 2;
+
+            T mid_key = left->keys[mid];
+
+            new_node->keys.assign(left->keys.begin() + mid + 1, left->keys.end());
+            left->keys.resize(mid);
+
+            if (!left->is_leaf) {
+                new_node->children.assign(left->children.begin() + mid + 1, left->children.end());
+                left->children.resize(mid + 1);
+            }
+
+            // Insert middle key back into parent at the same position
+            node->keys.insert(node->keys.begin() + idx, mid_key);
+            node->children.insert(node->children.begin() + idx + 1, new_node);
+        }
     }
 
     void fill_child(Node* node, int idx) {
@@ -339,6 +366,8 @@ private:
                 return true;
             } else {
                 // Case 2: Key is in internal node
+                // For Order 3, merging two min-key children causes overflow (3 keys > max 2).
+                // Always use predecessor/successor approach to avoid this issue.
                 if (static_cast<int>(node->children[idx]->keys.size()) > min_keys) {
                     // Case 2a: Left child has enough keys
                     T pred = get_predecessor(node->children[idx]);
@@ -351,8 +380,27 @@ private:
                     return remove_from_node(node->children[idx + 1], succ);
                 } else {
                     // Case 2c: Both children have minimum keys - merge them
+                    // The key at node->keys[idx] gets pushed down to merged child.
+                    // merge_children handles overflow by splitting if needed.
                     merge_children(node, idx);
-                    return remove_from_node(node->children[idx], key);
+
+                    // After merge (and possible split), find where the key ended up.
+                    // Search for it in the current node first.
+                    int new_idx = 0;
+                    while (new_idx < static_cast<int>(node->keys.size()) && node->keys[new_idx] < key) {
+                        new_idx++;
+                    }
+
+                    if (new_idx < static_cast<int>(node->keys.size()) && node->keys[new_idx] == key) {
+                        // Key was pushed back up as the split middle - handle as internal node key
+                        // Use Case 2a (predecessor) since left child should have enough keys after split
+                        T pred = get_predecessor(node->children[new_idx]);
+                        node->keys[new_idx] = pred;
+                        return remove_from_node(node->children[new_idx], pred);
+                    } else {
+                        // Key is in one of the children
+                        return remove_from_node(node->children[new_idx], key);
+                    }
                 }
             }
         } else {
