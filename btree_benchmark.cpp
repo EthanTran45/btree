@@ -1,4 +1,4 @@
-#include "btree.cpp"
+#include "btree.hpp"
 #include <chrono>
 #include <random>
 #include <algorithm>
@@ -79,9 +79,8 @@ BenchmarkResult benchmark_insert_random(const std::vector<int>& data) {
             tree.insert(val);
         }
         double elapsed = timer.elapsed_ms();
-        if (run > 0 && elapsed < best_ms) {  // Skip first run (warmup)
-            best_ms = elapsed;
-        } else if (run == 1) {
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
             best_ms = elapsed;
         }
     }
@@ -98,9 +97,8 @@ BenchmarkResult benchmark_insert_sequential(const std::vector<int>& data) {
             tree.insert(val);
         }
         double elapsed = timer.elapsed_ms();
-        if (run > 0 && elapsed < best_ms) {
-            best_ms = elapsed;
-        } else if (run == 1) {
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
             best_ms = elapsed;
         }
     }
@@ -117,14 +115,34 @@ BenchmarkResult benchmark_search(BTree<int, Order>& tree, const std::vector<int>
         for (int val : queries) {
             if (tree.search(val)) found++;
         }
+        (void)found;  // Ensure variable is "used"
         double elapsed = timer.elapsed_ms();
-        if (run > 0 && elapsed < best_ms) {
-            best_ms = elapsed;
-        } else if (run == 1) {
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
             best_ms = elapsed;
         }
     }
     return {"BTree<" + std::to_string(Order) + "> search", best_ms, queries.size()};
+}
+
+// Benchmark find() operation (iterator-based lookup)
+template<int Order>
+BenchmarkResult benchmark_find(BTree<int, Order>& tree, const std::vector<int>& queries) {
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile int found = 0;  // Prevent optimization
+        for (int val : queries) {
+            if (tree.find(val) != tree.end()) found++;
+        }
+        (void)found;  // Ensure variable is "used"
+        double elapsed = timer.elapsed_ms();
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
+            best_ms = elapsed;
+        }
+    }
+    return {"BTree<" + std::to_string(Order) + "> find", best_ms, queries.size()};
 }
 
 // Benchmark remove operation
@@ -158,10 +176,10 @@ BenchmarkResult benchmark_iterate(BTree<int, Order>& tree) {
         for (const auto& val : tree) {
             sum += val;
         }
+        (void)sum;  // Ensure variable is "used"
         double elapsed = timer.elapsed_ms();
-        if (run > 0 && elapsed < best_ms) {
-            best_ms = elapsed;
-        } else if (run == 1) {
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
             best_ms = elapsed;
         }
     }
@@ -178,9 +196,8 @@ BenchmarkResult benchmark_set_insert(const std::vector<int>& data) {
             s.insert(val);
         }
         double elapsed = timer.elapsed_ms();
-        if (run > 0 && elapsed < best_ms) {
-            best_ms = elapsed;
-        } else if (run == 1) {
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
             best_ms = elapsed;
         }
     }
@@ -193,16 +210,34 @@ BenchmarkResult benchmark_set_search(std::set<int>& s, const std::vector<int>& q
         Timer timer;
         volatile int found = 0;
         for (int val : queries) {
-            if (s.find(val) != s.end()) found++;
+            if (s.count(val) > 0) found++;
         }
+        (void)found;  // Ensure variable is "used"
         double elapsed = timer.elapsed_ms();
-        if (run > 0 && elapsed < best_ms) {
-            best_ms = elapsed;
-        } else if (run == 1) {
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
             best_ms = elapsed;
         }
     }
     return {"std::set search", best_ms, queries.size()};
+}
+
+BenchmarkResult benchmark_set_find(std::set<int>& s, const std::vector<int>& queries) {
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile int found = 0;
+        for (int val : queries) {
+            if (s.find(val) != s.end()) found++;
+        }
+        (void)found;  // Ensure variable is "used"
+        double elapsed = timer.elapsed_ms();
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
+            best_ms = elapsed;
+        }
+    }
+    return {"std::set find", best_ms, queries.size()};
 }
 
 BenchmarkResult benchmark_set_remove(const std::vector<int>& data) {
@@ -231,10 +266,10 @@ BenchmarkResult benchmark_set_iterate(std::set<int>& s) {
         for (const auto& val : s) {
             sum += val;
         }
+        (void)sum;  // Ensure variable is "used"
         double elapsed = timer.elapsed_ms();
-        if (run > 0 && elapsed < best_ms) {
-            best_ms = elapsed;
-        } else if (run == 1) {
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
             best_ms = elapsed;
         }
     }
@@ -266,11 +301,16 @@ void run_benchmarks_for_order(size_t /*n*/, const std::vector<int>& random_data,
     // Search benchmarks
     print_result(benchmark_search<Order>(tree, random_data));
 
+    // Find benchmark (iterator-based lookup)
+    print_result(benchmark_find<Order>(tree, random_data));
+
     // Iterate benchmark
     print_result(benchmark_iterate<Order>(tree));
 
-    // NOTE: Remove benchmark skipped due to bug in remove() with random data
-    // print_result(benchmark_remove<Order>(random_data));
+    // Remove benchmark (skipped for Order 3 due to known bug with random removal patterns)
+    if constexpr (Order >= 4) {
+        print_result(benchmark_remove<Order>(random_data));
+    }
 }
 
 void run_set_benchmarks(size_t /*n*/, const std::vector<int>& random_data) {
@@ -284,9 +324,9 @@ void run_set_benchmarks(size_t /*n*/, const std::vector<int>& random_data) {
     }
 
     print_result(benchmark_set_search(s, random_data));
+    print_result(benchmark_set_find(s, random_data));
     print_result(benchmark_set_iterate(s));
-    // Skipped to match BTree benchmarks
-    // print_result(benchmark_set_remove(random_data));
+    print_result(benchmark_set_remove(random_data));
 }
 
 int main(int argc, char* argv[]) {
