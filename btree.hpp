@@ -48,7 +48,11 @@ class InlineVec {
     static_assert(Cap > 0, "InlineVec capacity must be positive");
 
     alignas(U) unsigned char storage_[sizeof(U) * static_cast<std::size_t>(Cap)];
-    std::uint16_t size_ = 0;
+    // 32-bit count: a node transiently holds up to Order keys / Order+1 children
+    // before a split resolves the overflow, so a 16-bit counter would wrap (and
+    // silently drop the whole node) once Order reaches 65536. uint32_t covers
+    // every realistic order at a cost of two bytes per node.
+    std::uint32_t size_ = 0;
 
     U* data() noexcept { return std::launder(reinterpret_cast<U*>(storage_)); }
     const U* data() const noexcept {
@@ -58,7 +62,7 @@ class InlineVec {
     void destroy_all() noexcept {
         if constexpr (!std::is_trivially_destructible_v<U>) {
             U* d = data();
-            for (std::uint16_t i = 0; i < size_; ++i) {
+            for (std::uint32_t i = 0; i < size_; ++i) {
                 d[i].~U();
             }
         }
@@ -125,13 +129,45 @@ public:
             if (i == size_) {
                 ::new (static_cast<void*>(d + size_)) U(value);
             } else {
-                // Open a gap: construct a new last slot from the current last,
-                // shift the interior up, then overwrite the vacated slot.
+                // Copy the incoming value into a temporary BEFORE touching the
+                // buffer: if that copy throws, the container is left completely
+                // unchanged (strong guarantee) and no half-constructed slot is
+                // orphaned. Every step after this point is a move, which is
+                // noexcept for the types the tree stores, so the gap-open cannot
+                // throw partway through and leak or corrupt the node.
+                U tmp(value);
                 ::new (static_cast<void*>(d + size_)) U(std::move(d[size_ - 1]));
                 for (std::size_t j = size_ - 1; j > i; --j) {
                     d[j] = std::move(d[j - 1]);
                 }
-                d[i] = value;
+                d[i] = std::move(tmp);
+            }
+        }
+        ++size_;
+        return d + i;
+    }
+
+    // Move-insert `value` before `pos`. Mirror of the copy overload, but the
+    // incoming value is relocated by move rather than copied, so for a
+    // noexcept-move U the whole operation is noexcept — no `tmp` staging is
+    // needed since the caller has already agreed to move from `value`. The
+    // B-tree's rebalancing (borrow_from_prev) uses this so a repair on the
+    // delete unwind cannot throw and break remove()'s strong guarantee.
+    U* insert(const U* pos, U&& value) {
+        U* d = data();
+        std::size_t i = static_cast<std::size_t>(pos - d);
+        if constexpr (std::is_trivially_copyable_v<U>) {
+            std::memmove(d + i + 1, d + i, (size_ - i) * sizeof(U));
+            std::memcpy(static_cast<void*>(d + i), std::addressof(value), sizeof(U));
+        } else {
+            if (i == size_) {
+                ::new (static_cast<void*>(d + size_)) U(std::move(value));
+            } else {
+                ::new (static_cast<void*>(d + size_)) U(std::move(d[size_ - 1]));
+                for (std::size_t j = size_ - 1; j > i; --j) {
+                    d[j] = std::move(d[j - 1]);
+                }
+                d[i] = std::move(value);
             }
         }
         ++size_;
@@ -169,7 +205,7 @@ public:
                 ::new (static_cast<void*>(d + i)) U();
             }
         }
-        size_ = static_cast<std::uint16_t>(n);
+        size_ = static_cast<std::uint32_t>(n);
     }
 
     // Append `n` elements relocated from `src` (used by split/merge). Trivial
@@ -183,7 +219,7 @@ public:
                 ::new (static_cast<void*>(d + i)) U(std::move(src[i]));
             }
         }
-        size_ = static_cast<std::uint16_t>(size_ + n);
+        size_ = static_cast<std::uint32_t>(size_ + n);
     }
 };
 
@@ -204,6 +240,11 @@ class SlabPool {
 
     void add_slab() {
         std::size_t bytes = block_size_ * blocks_per_slab_;
+        // Reserve the tracking slot first. If push_back had to grow slabs_ and
+        // that growth threw *after* the slab allocation below, the slab would be
+        // lost (never recorded, never freed). Reserving hoists the only throwing
+        // step ahead of the raw ::operator new so the slab can't leak.
+        slabs_.reserve(slabs_.size() + 1);
         void* slab = ::operator new(bytes, std::align_val_t(block_align_));
         slabs_.push_back(slab);
         bump_ = static_cast<char*>(slab);
@@ -254,7 +295,14 @@ public:
             free_list_ = *static_cast<void**>(p);
             return p;
         }
-        if (bump_ + block_size_ > bump_end_) {
+        // Check remaining capacity without forming an invalid pointer. When the
+        // pool has no current slab (fresh, released, or moved-from) bump_ is null,
+        // and `nullptr + block_size_` would be undefined behavior; the null test
+        // short-circuits that. Otherwise bump_ and bump_end_ point into the same
+        // slab, so the subtraction is well-defined and also avoids the past-the-end
+        // pointer that `bump_ + block_size_` forms when a slab is exactly full.
+        if (bump_ == nullptr ||
+            static_cast<std::size_t>(bump_end_ - bump_) < block_size_) {
             add_slab();
         }
         void* p = bump_;
@@ -288,6 +336,16 @@ public:
 template <typename T, int Order = 64>
 class BTree {
 private:
+    // Keys are relocated by move throughout (node splits/merges, borrow-based
+    // rebalancing, and InlineVec's noexcept erase/append_move). remove()'s strong
+    // exception guarantee and InlineVec's noexcept relocation both depend on those
+    // moves not throwing, so require it explicitly: a throwing-move T would
+    // otherwise corrupt the tree or call std::terminate silently.
+    static_assert(std::is_nothrow_move_constructible_v<T> &&
+                      std::is_nothrow_move_assignable_v<T>,
+                  "BTree<T> requires T to be nothrow move-constructible and "
+                  "nothrow move-assignable");
+
     // A leaf node: just its keys. Capacity Order matches the reactive design's
     // transient overflow (a node may briefly hold Order keys before split_child
     // runs on the recursion unwind). This bound is tight for every order incl. 3.
@@ -465,6 +523,18 @@ private:
     btree_detail::SlabPool internal_pool_;  // blocks sized for InternalNode
     static constexpr int max_keys = Order - 1;
     static constexpr int min_keys = (Order - 1) / 2;
+
+    // A lookup only ever compares keys with operator< (lower_index /
+    // std::lower_bound) and operator== (the exact-match check); both must exist
+    // for any usable key type, so this expression is well-formed for every T.
+    // It is true for arithmetic keys and std::string (their comparisons are
+    // noexcept) and false only when a user key type's comparison can throw. Used
+    // to give search()/contains() a conditional noexcept: honestly noexcept in
+    // the common case, without promising noexcept for throwing comparators (a
+    // thrown comparison from a noexcept function would otherwise call terminate).
+    static constexpr bool nothrow_search =
+        noexcept(std::declval<const T&>() < std::declval<const T&>()) &&
+        noexcept(std::declval<const T&>() == std::declval<const T&>());
 
 public:
     // Forward iterator for in-order traversal
@@ -778,15 +848,18 @@ private:
         }
     }
 
+    // Right-rotate through the parent: the separator drops into the front of the
+    // underful child and the left sibling's last key rises to the separator. All
+    // key relocation is by move (noexcept for a nothrow-move T), so this repair
+    // runs on the delete unwind without any throwing step — see remove()'s
+    // strong-guarantee note.
     void borrow_from_prev(Node* node, size_t idx) {
         Node* child = ch(node)[idx];
         Node* sibling = ch(node)[idx - 1];
 
-        // Shift all keys in child one step ahead
-        child->keys.insert(child->keys.begin(), node->keys[idx - 1]);
-
-        // Move key from sibling to parent
-        node->keys[idx - 1] = sibling->keys.back();
+        // Separator moves down to the front of child; sibling's last key moves up.
+        child->keys.insert(child->keys.begin(), std::move(node->keys[idx - 1]));
+        node->keys[idx - 1] = std::move(sibling->keys.back());
         sibling->keys.pop_back();
 
         // Move child pointer if not leaf
@@ -796,15 +869,16 @@ private:
         }
     }
 
+    // Left-rotate through the parent: the separator drops onto the back of the
+    // underful child and the right sibling's first key rises to the separator.
+    // Move-only for the same exception-safety reason as borrow_from_prev.
     void borrow_from_next(Node* node, size_t idx) {
         Node* child = ch(node)[idx];
         Node* sibling = ch(node)[idx + 1];
 
-        // Move key from parent to child
-        child->keys.push_back(node->keys[idx]);
-
-        // Move key from sibling to parent
-        node->keys[idx] = sibling->keys[0];
+        // Separator moves down to the back of child; sibling's first key moves up.
+        child->keys.push_back(std::move(node->keys[idx]));
+        node->keys[idx] = std::move(sibling->keys[0]);
         sibling->keys.erase(sibling->keys.begin());
 
         // Move child pointer if not leaf
@@ -832,13 +906,19 @@ private:
         size_t child_idx;
         bool removed;
         if (here) {
-            // Internal key: overwrite it with its in-leaf predecessor (the rightmost
+            // Internal key: replace it with its in-leaf predecessor (the rightmost
             // key of the left subtree), then delete that predecessor from the leaf.
-            // Copy by value: the recursive delete below mutates the source leaf.
+            // Copy by value first (pre-commit: if this copy throws, nothing has
+            // been mutated yet). Delete the predecessor from the subtree, THEN
+            // overwrite the separator by *move* — that write lands after the leaf
+            // erase (the sole commit point) and is noexcept, so it cannot break
+            // remove()'s strong guarantee. The separator belongs to this node, not
+            // the recursed subtree, so it is never read during the recursion;
+            // leaving the old key in place until now yields the identical tree.
             T pred = get_predecessor(ch(node)[idx]);
-            node->keys[idx] = pred;
             child_idx = idx;
             removed = remove_rec(ch(node)[child_idx], pred);
+            node->keys[idx] = std::move(pred);
         } else {
             // lower_bound points at the subtree that may contain the key.
             child_idx = idx;
@@ -851,47 +931,64 @@ private:
         return removed;
     }
 
-    // Helper to find a key and build iterator stack. The ancestor path is pushed
-    // directly onto the result iterator's inline stack as we descend (no separate
-    // container, no allocation on the found path).
+    // Helper to find a key and build the iterator stack. Returns an iterator to
+    // the FIRST (leftmost, in-order) element equal to `key`, or end() if absent.
+    //
+    // Returning the first equal element matters when duplicates are present: a
+    // copy of `key` can live both at an internal separator and further left in
+    // that separator's left subtree. Stopping at the first internal match (as a
+    // naive descent would) yields a middle occurrence, so iterating
+    // [find(key), end()) would silently skip the earlier duplicates and disagree
+    // with std::find(begin(), end(), key). We therefore descend all the way to a
+    // leaf along the lower_bound path, then take the deepest match on that path,
+    // which is guaranteed to be the leftmost occurrence.
     iterator find_impl(const T& key) const {
         iterator result;  // empty stack, current_ == nullptr (i.e. end())
+        if (root == nullptr) {
+            return iterator();
+        }
+
+        // Descend to a leaf, pushing the lower_bound child index at each level.
         Node* node = root;
-
-        while (node != nullptr) {
+        while (true) {
             size_t i = lower_index(node->keys.begin(), node->keys.size(), key);
+            result.stack_.push({node, i});
+            if (node->is_leaf) {
+                break;
+            }
+            node = ch(node)[i];
+        }
 
-            if (i < node->keys.size() && node->keys[i] == key) {
-                // Found the key - point the iterator at this position.
-                result.stack_.push({node, i});
-                result.current_ = &node->keys[i];
+        // Walk back up to the deepest frame whose key at its stored index equals
+        // `key`. Every frame's index is its lower_bound position and we always
+        // descended the left subtree, so any earlier duplicate would sit deeper
+        // on this same path -- hence the deepest match is the first occurrence.
+        while (!result.stack_.empty()) {
+            auto& frame = result.stack_.top();
+            Node* fn = frame.node;
+            size_t i = frame.index;
 
-                // Advance index for next iteration
-                auto& frame = result.stack_.top();
-                frame.index++;
+            if (i < fn->keys.size() && fn->keys[i] == key) {
+                result.current_ = &fn->keys[i];
+                frame.index = i + 1;  // next in-order step resumes after this key
 
-                // If not a leaf, push left path of right subtree
-                if (!node->is_leaf && frame.index < ch(node).size()) {
-                    Node* right_child = ch(node)[frame.index];
+                // If internal, the successor is the left spine of the right
+                // subtree; push it so ++ descends there first. (fn/i are locals,
+                // so the pushes below can't be disturbed by a stack realloc.)
+                if (!fn->is_leaf && i + 1 < ch(fn).size()) {
+                    Node* right_child = ch(fn)[i + 1];
                     while (right_child != nullptr) {
                         result.stack_.push({right_child, 0});
                         if (right_child->is_leaf) break;
                         right_child = ch(right_child)[0];
                     }
                 }
-
                 return result;
             }
-
-            if (node->is_leaf) {
-                return iterator();  // Not found
-            }
-
-            result.stack_.push({node, i});
-            node = ch(node)[i];
+            result.stack_.pop();
         }
 
-        return iterator();
+        return iterator();  // key not present
     }
 
 public:
@@ -974,8 +1071,9 @@ public:
         return removed;
     }
 
-    // O(log n) - Check if a key exists in the tree
-    [[nodiscard]] bool search(const T& key) const noexcept {
+    // O(log n) - Check if a key exists in the tree. noexcept iff T's comparisons
+    // are noexcept (always so for arithmetic keys and std::string).
+    [[nodiscard]] bool search(const T& key) const noexcept(nothrow_search) {
         if (root == nullptr) {
             return false;
         }
@@ -983,7 +1081,7 @@ public:
     }
 
     // O(log n) - Alias for search()
-    [[nodiscard]] bool contains(const T& key) const noexcept {
+    [[nodiscard]] bool contains(const T& key) const noexcept(nothrow_search) {
         return search(key);
     }
 

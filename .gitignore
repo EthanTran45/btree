@@ -1,6 +1,7 @@
 # Compiled binaries
 btree
 btree_test
+*.exe
 
 # Object files
 *.o
