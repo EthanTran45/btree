@@ -307,10 +307,8 @@ void run_benchmarks_for_order(size_t /*n*/, const std::vector<int>& random_data,
     // Iterate benchmark
     print_result(benchmark_iterate<Order>(tree));
 
-    // Remove benchmark (skipped for Order 3 due to known bug with random removal patterns)
-    if constexpr (Order >= 4) {
-        print_result(benchmark_remove<Order>(random_data));
-    }
+    // Remove benchmark
+    print_result(benchmark_remove<Order>(random_data));
 }
 
 void run_set_benchmarks(size_t /*n*/, const std::vector<int>& random_data) {

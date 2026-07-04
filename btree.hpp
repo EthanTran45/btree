@@ -7,10 +7,12 @@
 #include <functional>
 #include <algorithm>
 
-// B-tree implementation with configurable order.
+// B-tree implementation with configurable order (any Order >= 3).
 //
-// Note: Order 3 has a known issue with remove() for certain random deletion
-// patterns. For production use, Order >= 4 is recommended.
+// Uses reactive (bottom-up) rebalancing: inserts descend to a leaf and split
+// overflowed nodes on the way back up; removes erase at a leaf and repair
+// underflowed nodes on the way back up. This keeps every node within
+// [min_keys, max_keys] and all leaves at the same depth for every order.
 //
 // Iterator Invalidation:
 // - insert(): Invalidates all iterators (may cause node splits/reallocations)
@@ -27,10 +29,11 @@ private:
         bool is_leaf;
 
         Node(bool leaf = true) : is_leaf(leaf) {
-            // Pre-allocate to avoid reallocations during node filling
-            keys.reserve(Order - 1);  // max_keys
+            // Pre-allocate to avoid reallocations. Reactive insert transiently
+            // holds Order keys / Order+1 children before splitting an overflow.
+            keys.reserve(Order);  // max_keys + 1 (transient overflow before split)
             if (!leaf) {
-                children.reserve(Order);  // max_keys + 1
+                children.reserve(Order + 1);  // max_keys + 2 (transient overflow)
             }
         }
 
@@ -141,11 +144,15 @@ public:
 
 private:
 
+    // Split an overflowed child (parent->children[index] holds max_keys+1 keys).
+    // The median key moves up into the parent; the left half keeps `mid` keys and
+    // the new right node gets the rest. Valid for every order: left ends with
+    // floor(Order/2) keys and right with exactly min_keys keys.
     void split_child(Node* parent, size_t index) {
         Node* full_child = parent->children[index];
         Node* new_node = new Node(full_child->is_leaf);
 
-        size_t mid = max_keys / 2;
+        size_t mid = full_child->keys.size() / 2;
         T mid_key = full_child->keys[mid];
 
         new_node->keys.assign(full_child->keys.begin() + mid + 1, full_child->keys.end());
@@ -160,23 +167,23 @@ private:
         parent->children.insert(parent->children.begin() + index + 1, new_node);
     }
 
-    void insert_non_full(Node* node, const T& key) {
+    // Reactive insert: descend to the target leaf and insert there, then split
+    // the child on the way back up if it overflowed past max_keys.
+    void insert_rec(Node* node, const T& key) {
         if (node->is_leaf) {
-            // Use binary search to find insertion position
+            // Binary search for insertion position (duplicates allowed).
             auto pos = std::lower_bound(node->keys.begin(), node->keys.end(), key);
             node->keys.insert(pos, key);
-        } else {
-            // Use binary search to find child
-            auto pos = std::upper_bound(node->keys.begin(), node->keys.end(), key);
-            size_t i = pos - node->keys.begin();
+            return;
+        }
+        // upper_bound places a new duplicate after existing equal keys.
+        auto pos = std::upper_bound(node->keys.begin(), node->keys.end(), key);
+        size_t i = pos - node->keys.begin();
 
-            if (node->children[i]->keys.size() == static_cast<size_t>(max_keys)) {
-                split_child(node, i);
-                if (key > node->keys[i]) {
-                    i++;
-                }
-            }
-            insert_non_full(node->children[i], key);
+        insert_rec(node->children[i], key);
+
+        if (node->children[i]->keys.size() > static_cast<size_t>(max_keys)) {
+            split_child(node, i);
         }
     }
 
@@ -284,36 +291,18 @@ private:
         // Delete right node (but not its children, as they're now in left)
         right->children.clear();
         delete right;
-
-        // For small orders (like 3), merging can cause overflow.
-        // If so, split the merged node and push a key back to parent.
-        if (left->keys.size() > static_cast<size_t>(max_keys)) {
-            Node* new_node = new Node(left->is_leaf);
-            // Use floor division for mid - ensures left gets at least floor(n/2) keys
-            size_t total_keys = left->keys.size();
-            size_t mid = total_keys / 2;
-
-            // Ensure both halves have at least 1 key
-            if (mid == 0) mid = 1;
-            if (mid >= total_keys - 1) mid = total_keys - 2;
-
-            T mid_key = left->keys[mid];
-
-            new_node->keys.assign(left->keys.begin() + mid + 1, left->keys.end());
-            left->keys.resize(mid);
-
-            if (!left->is_leaf) {
-                new_node->children.assign(left->children.begin() + mid + 1, left->children.end());
-                left->children.resize(mid + 1);
-            }
-
-            // Insert middle key back into parent at the same position
-            node->keys.insert(node->keys.begin() + idx, mid_key);
-            node->children.insert(node->children.begin() + idx + 1, new_node);
-        }
+        // No overflow is possible: reactive delete only merges an underflowed
+        // child (min_keys-1 keys) with a minimum sibling (min_keys keys), giving
+        // 2*min_keys <= max_keys keys for every order.
     }
 
-    void fill_child(Node* node, size_t idx) {
+    // Restore the min-keys invariant for children[idx] after a deletion may have
+    // left it with fewer than min_keys keys: borrow from a sibling that can
+    // spare a key, otherwise merge with an adjacent sibling.
+    void fix_underflow(Node* node, size_t idx) {
+        if (node->children[idx]->keys.size() >= static_cast<size_t>(min_keys)) {
+            return;  // no underflow
+        }
         // Try to borrow from left sibling
         if (idx > 0 && node->children[idx - 1]->keys.size() > static_cast<size_t>(min_keys)) {
             borrow_from_prev(node, idx);
@@ -326,9 +315,9 @@ private:
         // Merge with a sibling
         else {
             if (idx < node->children.size() - 1) {
-                merge_children(node, idx);
+                merge_children(node, idx);       // merge with right sibling
             } else {
-                merge_children(node, idx - 1);
+                merge_children(node, idx - 1);   // rightmost child: merge into left
             }
         }
     }
@@ -369,74 +358,42 @@ private:
         }
     }
 
-    bool remove_from_node(Node* node, const T& key) {
-        // Binary search for key position
+    // Reactive delete: recurse to a leaf to perform the actual erase (swapping an
+    // internal key with its in-leaf predecessor first), then repair any child that
+    // underflowed on the way back up. Returns true if the key was found.
+    bool remove_rec(Node* node, const T& key) {
         auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
         size_t idx = it - node->keys.begin();
+        bool here = (idx < node->keys.size() && node->keys[idx] == key);
 
-        // Key found in this node
-        if (idx < node->keys.size() && node->keys[idx] == key) {
-            if (node->is_leaf) {
-                // Case 1: Key is in leaf node - simply remove it
+        if (node->is_leaf) {
+            if (here) {
                 node->keys.erase(node->keys.begin() + idx);
                 return true;
-            } else {
-                // Case 2: Key is in internal node
-                // For Order 3, merging two min-key children causes overflow (3 keys > max 2).
-                // Always use predecessor/successor approach to avoid this issue.
-                if (node->children[idx]->keys.size() > static_cast<size_t>(min_keys)) {
-                    // Case 2a: Left child has enough keys
-                    T pred = get_predecessor(node->children[idx]);
-                    node->keys[idx] = pred;
-                    return remove_from_node(node->children[idx], pred);
-                } else if (node->children[idx + 1]->keys.size() > static_cast<size_t>(min_keys)) {
-                    // Case 2b: Right child has enough keys
-                    T succ = get_successor(node->children[idx + 1]);
-                    node->keys[idx] = succ;
-                    return remove_from_node(node->children[idx + 1], succ);
-                } else {
-                    // Case 2c: Both children have minimum keys - merge them
-                    // The key at node->keys[idx] gets pushed down to merged child.
-                    // merge_children handles overflow by splitting if needed.
-                    merge_children(node, idx);
-
-                    // After merge (and possible split), find where the key ended up.
-                    // Search for it in the current node first.
-                    auto new_it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
-                    size_t new_idx = new_it - node->keys.begin();
-
-                    if (new_idx < node->keys.size() && node->keys[new_idx] == key) {
-                        // Key was pushed back up as the split middle - handle as internal node key
-                        // Use Case 2a (predecessor) since left child should have enough keys after split
-                        T pred = get_predecessor(node->children[new_idx]);
-                        node->keys[new_idx] = pred;
-                        return remove_from_node(node->children[new_idx], pred);
-                    } else {
-                        // Key is in one of the children
-                        return remove_from_node(node->children[new_idx], key);
-                    }
-                }
             }
-        } else {
-            // Key not in this node
-            if (node->is_leaf) {
-                return false;  // Key not found
-            }
-
-            bool is_last = (idx == node->keys.size());
-
-            // Ensure child has enough keys before descending
-            if (node->children[idx]->keys.size() <= static_cast<size_t>(min_keys)) {
-                fill_child(node, idx);
-            }
-
-            // After filling, the child at idx may have been merged with previous sibling
-            if (is_last && idx > node->keys.size()) {
-                return remove_from_node(node->children[idx - 1], key);
-            } else {
-                return remove_from_node(node->children[idx], key);
-            }
+            return false;  // Key not found
         }
+
+        size_t child_idx;
+        bool removed;
+        if (here) {
+            // Internal key: overwrite it with its in-leaf predecessor (the rightmost
+            // key of the left subtree), then delete that predecessor from the leaf.
+            // Copy by value: the recursive delete below mutates the source leaf.
+            T pred = get_predecessor(node->children[idx]);
+            node->keys[idx] = pred;
+            child_idx = idx;
+            removed = remove_rec(node->children[child_idx], pred);
+        } else {
+            // lower_bound points at the subtree that may contain the key.
+            child_idx = idx;
+            removed = remove_rec(node->children[child_idx], key);
+        }
+
+        if (removed) {
+            fix_underflow(node, child_idx);
+        }
+        return removed;
     }
 
     // Helper to find a key and build iterator stack
@@ -531,14 +488,16 @@ public:
             return;
         }
 
-        if (root->keys.size() == static_cast<size_t>(max_keys)) {
+        insert_rec(root, key);
+
+        // If the root overflowed, grow a new root above it and split.
+        if (root->keys.size() > static_cast<size_t>(max_keys)) {
             Node* new_root = new Node(false);
             new_root->children.push_back(root);
             split_child(new_root, 0);
             root = new_root;
         }
 
-        insert_non_full(root, key);
         size_++;
     }
 
@@ -548,7 +507,7 @@ public:
             return false;
         }
 
-        bool removed = remove_from_node(root, key);
+        bool removed = remove_rec(root, key);
 
         if (removed) {
             size_--;

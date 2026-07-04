@@ -1253,8 +1253,16 @@ TEST(test_self_move_assignment) {
     tree.insert(20);
     tree.insert(30);
 
-    // Self-move assignment - implementation checks `this != &other` so tree is preserved
+    // Self-move assignment - implementation checks `this != &other` so tree is preserved.
+    // The self-move is deliberate here; silence the (correct) -Wself-move warning.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
+#endif
     tree = std::move(tree);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
     // Tree should be preserved (self-assignment is a no-op)
     ASSERT_EQ(tree.size(), 3u);
@@ -1831,9 +1839,9 @@ TEST(test_remove_case_2c_recursive) {
     ASSERT_EQ(static_cast<size_t>(count), present.size());
 }
 
-// Test: Order 4 sustained merge-split cycles (avoids Order 3 known issues)
+// Test: Order 4 sustained merge-split cycles
 TEST(test_order_4_merge_split_cycle) {
-    BTree<int, 4> tree;  // Order 4: more reliable than Order 3
+    BTree<int, 4> tree;  // Order 4: min_keys=1, max_keys=3
 
     // Insert elements
     for (int i = 1; i <= 30; i++) {

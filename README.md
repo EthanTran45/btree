@@ -5,14 +5,12 @@ A header-only C++ implementation of a B-tree data structure.
 ## Overview
 
 This project provides a generic, templated B-tree implementation supporting:
-- Configurable order (default: 3, recommended: 4+)
+- Configurable order (default: 3; any order >= 3)
 - Any comparable key type (int, string, double, etc.)
 - Insert, search, remove, and find operations
 - In-order traversal with STL-compatible iterators
 - Binary search within nodes for O(log k) performance
 - Move semantics
-
-**Note:** Order 3 has a known issue with `remove()` for certain random deletion patterns. For production use, Order >= 4 is recommended.
 
 ## Building
 
@@ -70,7 +68,7 @@ for (const auto& key : tree) {
     std::cout << key << " ";
 }
 
-// Create a BTree with custom order (recommended: 4+)
+// Create a BTree with custom order
 BTree<std::string, 5> string_tree;
 string_tree.insert("apple");
 string_tree.insert("banana");
@@ -162,7 +160,7 @@ Compile and run the benchmark suite:
 g++ -std=c++17 -O2 -o btree_benchmark btree_benchmark.cpp && ./btree_benchmark
 ```
 
-The benchmark compares BTree performance against `std::set` across different tree orders (3, 10, 50, 100) and data sizes (10K, 100K, 1M elements). Operations tested include insert, search, find, iteration, and remove (Order >= 4 only).
+The benchmark compares BTree performance against `std::set` across different tree orders (3, 10, 50, 100) and data sizes (10K, 100K, 1M elements). Operations tested include insert, search, find, iteration, and remove.
 
 You can specify custom sizes via command line:
 
