@@ -1466,6 +1466,51 @@ TEST(test_find_with_duplicates) {
     ASSERT_EQ(count, 3);  // All duplicates should be in tree
 }
 
+// Test: find() returns the FIRST equal element, so iterating [find(k), end())
+// visits every duplicate of k and agrees with std::find over the same range.
+// Regression for a bug where find() could land on a middle duplicate (one
+// promoted to an internal separator), silently skipping earlier equal copies.
+// Uses a small order and many duplicates to force keys into internal nodes.
+TEST(test_find_returns_first_duplicate) {
+    for (int trial = 0; trial < 2; ++trial) {
+        BTree<int, 3> tree;               // small order => deep tree, internal dups
+        std::multiset<int> ref;
+        // Interleave copies so duplicates spread across nodes/levels.
+        for (int rep = 0; rep < 6; ++rep) {
+            for (int k = 0; k < 10; ++k) {
+                if (trial == 1 && (rep + k) % 2) continue;  // vary the shape
+                tree.insert(k);
+                ref.insert(k);
+            }
+        }
+        std::vector<int> sorted(ref.begin(), ref.end());
+
+        for (int k = 0; k < 10; ++k) {
+            long total = std::count(sorted.begin(), sorted.end(), k);
+            auto it = tree.find(k);
+            if (total == 0) { ASSERT_TRUE(it == tree.end()); continue; }
+
+            ASSERT_TRUE(it != tree.end());
+            ASSERT_EQ(*it, k);
+
+            // Walking forward from find(k) must reach every copy of k...
+            long reachable = 0;
+            for (auto j = it; j != tree.end() && *j == k; ++j) ++reachable;
+            ASSERT_EQ(reachable, total);
+
+            // ...and must be positioned exactly where std::find lands (first
+            // equal element), i.e. the remaining sequences are identical.
+            std::vector<int> from_find(it, tree.end());
+            std::vector<int> from_stdfind(std::find(tree.begin(), tree.end(), k),
+                                          tree.end());
+            ASSERT_TRUE(from_find == from_stdfind);
+            // The suffix from the first occurrence is exactly sorted[first..].
+            auto first = std::lower_bound(sorted.begin(), sorted.end(), k);
+            ASSERT_TRUE(from_find == std::vector<int>(first, sorted.end()));
+        }
+    }
+}
+
 // Test: find after modifications
 TEST(test_find_after_modifications) {
     BTree<int> tree;
@@ -2394,6 +2439,171 @@ TEST(test_order_5_min_keys_boundary) {
     }
 }
 
+// === remove() strong exception-safety ===
+
+// Key type whose COPY can be made to throw on demand, but whose MOVE is noexcept
+// (as BTree requires). `copy_budget` throws once that many copies have happened
+// since the last reset; `live` tracks net instances for leak detection.
+struct Thrower {
+    int v;
+    static long live;
+    static long copies;
+    static long copy_budget;  // -1 disables throwing
+
+    Thrower(int val = 0) : v(val) { ++live; }
+    Thrower(const Thrower& o) : v(o.v) {
+        if (copy_budget >= 0 && copies >= copy_budget) {
+            throw std::runtime_error("Thrower copy ctor");
+        }
+        ++copies;
+        ++live;
+    }
+    Thrower& operator=(const Thrower& o) {
+        if (copy_budget >= 0 && copies >= copy_budget) {
+            throw std::runtime_error("Thrower copy assign");
+        }
+        ++copies;
+        v = o.v;
+        return *this;
+    }
+    Thrower(Thrower&& o) noexcept : v(o.v) { ++live; }
+    Thrower& operator=(Thrower&& o) noexcept { v = o.v; return *this; }
+    ~Thrower() { --live; }
+    bool operator<(const Thrower& o) const noexcept { return v < o.v; }
+    bool operator==(const Thrower& o) const noexcept { return v == o.v; }
+};
+long Thrower::live = 0;
+long Thrower::copies = 0;
+long Thrower::copy_budget = -1;
+
+// Walk a tree down to empty; before each real removal, sweep the copy budget so a
+// copy throws at every point remove() performs one, and assert the STRONG
+// guarantee each time (tree byte-for-byte unchanged, size consistent, every key
+// still present). Returns the number of throws actually exercised.
+template <int Order>
+static long remove_exc_safety_walk(unsigned seed) {
+    Thrower::copy_budget = -1;
+    Thrower::copies = 0;
+    long throws_seen = 0;
+
+    BTree<Thrower, Order> tree;
+    std::multiset<int> ref;
+    std::mt19937 rng(seed);
+    for (int i = 0; i < 80; ++i) {
+        int x = static_cast<int>(rng() % 40);
+        tree.insert(Thrower(x));
+        ref.insert(x);
+    }
+
+    while (!ref.empty()) {
+        std::vector<int> snap(ref.begin(), ref.end());
+        size_t n = tree.size();
+        int key = snap[rng() % snap.size()];
+
+        for (long k = 0;; ++k) {
+            if (k > 500) throw std::runtime_error("budget sweep did not converge");
+            Thrower::copies = 0;
+            Thrower::copy_budget = k;
+            bool threw = false;
+            try {
+                tree.remove(Thrower(key));
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            Thrower::copy_budget = -1;  // disable throwing for the assertions below
+
+            if (threw) {
+                ++throws_seen;
+                // Strong guarantee: nothing changed.
+                ASSERT_EQ(tree.size(), n);
+                std::vector<int> now;
+                now.reserve(n);
+                for (const auto& t : tree) now.push_back(t.v);
+                ASSERT_TRUE(now == snap);
+                // No separator was duplicated / dropped: every key still findable.
+                for (int kv : snap) ASSERT_TRUE(tree.find(Thrower(kv)) != tree.end());
+            } else {
+                // Removed exactly one occurrence.
+                ref.erase(ref.find(key));
+                ASSERT_EQ(tree.size(), ref.size());
+                std::vector<int> now;
+                now.reserve(ref.size());
+                for (const auto& t : tree) now.push_back(t.v);
+                std::vector<int> expected(ref.begin(), ref.end());
+                ASSERT_TRUE(now == expected);
+                break;
+            }
+        }
+    }
+    return throws_seen;
+}
+
+TEST(test_remove_strong_exception_safety) {
+    Thrower::live = 0;
+    long total_throws = 0;
+    total_throws += remove_exc_safety_walk<3>(1);
+    total_throws += remove_exc_safety_walk<3>(2);
+    total_throws += remove_exc_safety_walk<4>(3);
+    total_throws += remove_exc_safety_walk<5>(4);
+    total_throws += remove_exc_safety_walk<6>(5);
+    total_throws += remove_exc_safety_walk<64>(6);
+
+    // The strong-guarantee path must actually have been exercised (otherwise the
+    // test would pass vacuously if remove() stopped copying entirely).
+    ASSERT_TRUE(total_throws > 0);
+    // Every Thrower constructed was destroyed: no leak on any throwing path.
+    ASSERT_EQ(Thrower::live, 0L);
+}
+
+// Deterministic, readable companion to the randomized walk: repeatedly remove the
+// minimum of an Order-3 tree, which forces the leftmost leaf to underflow and
+// repair via borrow_from_next / merge. Sweeping the copy budget makes a copy throw
+// at every point the repair would perform one; the tree must be left exactly
+// intact each time. This is precisely where the pre-fix code duplicated/dropped a
+// separator when a borrow's second copy threw, so this case fails pre-fix.
+TEST(test_remove_rebalance_throw_strong) {
+    Thrower::live = 0;
+    Thrower::copy_budget = -1;
+    Thrower::copies = 0;
+    {
+        BTree<Thrower, 3> tree;
+        std::vector<int> present;
+        for (int i = 0; i < 24; ++i) {
+            tree.insert(Thrower(i));
+            present.push_back(i);
+        }
+
+        while (!present.empty()) {
+            std::vector<int> snap = present;
+            size_t n = tree.size();
+            int key = present.front();  // remove the minimum
+            for (long k = 0;; ++k) {
+                if (k > 500) throw std::runtime_error("budget sweep did not converge");
+                Thrower::copies = 0;
+                Thrower::copy_budget = k;
+                bool threw = false;
+                try {
+                    tree.remove(Thrower(key));
+                } catch (const std::exception&) {
+                    threw = true;
+                }
+                Thrower::copy_budget = -1;
+                if (threw) {
+                    ASSERT_EQ(tree.size(), n);
+                    std::vector<int> now;
+                    for (const auto& t : tree) now.push_back(t.v);
+                    ASSERT_TRUE(now == snap);
+                } else {
+                    present.erase(present.begin());
+                    ASSERT_EQ(tree.size(), present.size());
+                    break;
+                }
+            }
+        }
+    }
+    ASSERT_EQ(Thrower::live, 0L);  // no leak on any throwing path
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -2423,6 +2633,8 @@ int main() {
     RUN_TEST(test_remove_all);
     RUN_TEST(test_remove_rebalancing);
     RUN_TEST(test_remove_reverse);
+    RUN_TEST(test_remove_strong_exception_safety);
+    RUN_TEST(test_remove_rebalance_throw_strong);
     RUN_TEST(test_move_constructor);
     RUN_TEST(test_move_assignment);
     RUN_TEST(test_stress_insert_remove);
@@ -2496,6 +2708,7 @@ int main() {
 
     // Additional tests - Find edge cases
     RUN_TEST(test_find_with_duplicates);
+    RUN_TEST(test_find_returns_first_duplicate);
     RUN_TEST(test_find_after_modifications);
 
     // Additional tests - Higher-order remove stress
