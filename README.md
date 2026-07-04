@@ -5,11 +5,12 @@ A header-only C++ implementation of a B-tree data structure.
 ## Overview
 
 This project provides a generic, templated B-tree implementation supporting:
-- Configurable order (default: 3; any order >= 3)
+- Configurable order (default: 64; any order >= 3)
 - Any comparable key type (int, string, double, etc.)
 - Insert, search, remove, and find operations
 - In-order traversal with STL-compatible iterators
-- Binary search within nodes for O(log k) performance
+- Cache-friendly node layout: each node is a single allocation with its keys
+  stored inline (see [Implementation notes](#implementation-notes))
 - Move semantics
 
 ## Building
@@ -31,7 +32,7 @@ g++ -std=c++17 -Wall -Wextra -o myprogram myprogram.cpp
 ```cpp
 #include "btree.hpp"
 
-// Create a BTree with default order (3)
+// Create a BTree with default order (64)
 BTree<int> tree;
 
 // Insert values
@@ -160,7 +161,7 @@ Compile and run the benchmark suite:
 g++ -std=c++17 -O2 -o btree_benchmark btree_benchmark.cpp && ./btree_benchmark
 ```
 
-The benchmark compares BTree performance against `std::set` across different tree orders (3, 10, 50, 100) and data sizes (10K, 100K, 1M elements). Operations tested include insert, search, find, iteration, and remove.
+The benchmark compares BTree performance against `std::set` across different tree orders (3, 10, 50, 64, 100) and data sizes (10K, 100K, 1M elements). Operations tested include insert, search, find, iteration, and remove.
 
 You can specify custom sizes via command line:
 
@@ -172,19 +173,50 @@ You can specify custom sizes via command line:
 
 Measured at **1,000,000 elements**, compiled with `g++ -O2` (GCC 16, Windows). Values are wall-clock **milliseconds for the whole batch of 1M operations — lower is better** (best of 3 runs). `std::set` is the red-black-tree baseline; its workload is random-order. Absolute numbers are machine-dependent, so treat the relative comparison as the takeaway.
 
-| Operation            | Order 3 | Order 10 | Order 50 | Order 100 | `std::set` |
-|----------------------|--------:|---------:|---------:|----------:|-----------:|
-| insert (random)      |  3049   |    794   |    422   |    360    |    1436    |
-| insert (sequential)  |   403   |    113   |     63   |     54    |     —      |
-| search               |  3295   |   1061   |    541   |    440    |    1530    |
-| find (iterator)      |  3519   |   1271   |    639   |    573    |    1523    |
-| iterate (full scan)  |   106   |     29   |    5.5   |    4.3    |     232    |
-| remove (random)      |  3781   |   1279   |    536   |    446    |    2044    |
+| Operation            | Order 3 | Order 10 | Order 50 | Order 64 (default) | Order 100 | `std::set` |
+|----------------------|--------:|---------:|---------:|-------------------:|----------:|-----------:|
+| insert (random)      |   408   |    113   |     90   |         99         |    114    |    503     |
+| insert (sequential)  |    74   |     19   |    9.4   |        8.7         |    8.2    |     —      |
+| search               |   452   |    131   |     90   |         88         |    109    |    630     |
+| find (iterator)      |   491   |    145   |    101   |        101         |    117    |    615     |
+| iterate (full scan)  |    23   |    4.6   |    2.3   |        2.2         |    2.1    |    109     |
+| remove (random)      |   548   |    172   |    102   |        116         |    124    |    745     |
 
 Takeaways:
-- **Higher orders are faster.** Larger nodes mean a shallower tree and fewer cache misses; the per-node binary search keeps in-node work cheap. Order 50–100 is the sweet spot for `int` keys.
-- **vs `std::set` at 1M (Order 100):** ~4× faster to build, ~3.5× faster to search, ~4.6× faster to remove, and **~54× faster** to iterate in sorted order — contiguous keys per node make the full scan far more cache-friendly than pointer-chasing a red-black tree.
-- **Order 3 is the slowest configuration** (deepest tree, most per-node overhead). It is correct for every operation, but choose a larger order when performance matters. The margins narrow at smaller sizes (10K/100K) but the ordering is the same.
+- **Default order 64 vs `std::set` at 1M:** ~5× faster to build, ~7× faster to search, ~6× faster to find/remove, and **~51× faster** to iterate in sorted order — inline, contiguous keys make both the descent and the full scan far more cache-friendly than pointer-chasing a red-black tree.
+- **Higher orders are faster, up to a sweet spot around 50–100.** Larger nodes mean a shallower tree and fewer cache misses; a branchless in-node key scan keeps per-node work cheap even at order 100. Order 3 is the slowest (deepest tree, most per-node overhead) but is correct and still comfortably beats `std::set`.
+- **Sequential insertion is nearly free** thanks to an O(1) append fast-path (a sorted-order bulk load of 1M ints takes <10 ms at the larger orders).
+- **Versus the previous `std::vector`-per-node implementation** (same machine, same benchmark): roughly **3× faster** across the board at order 3 and **1.3–1.7×** at order 100, with the largest gains from the single-allocation inline node layout and the branchless in-node search.
+
+## Implementation notes
+
+The library keeps the same B-tree algorithm and public API as before, but the
+data layout and inner loops are tuned for cache and branch behavior:
+
+- **Single-allocation inline nodes.** Each node stores its keys (and, for
+  internal nodes, its child pointers) in fixed-capacity buffers embedded in the
+  node itself (`btree_detail::InlineVec`) instead of two separate `std::vector`
+  members. A node is therefore one allocation with its keys co-resident with its
+  header, roughly halving cache misses per level. Element moves are gated on
+  `std::is_trivially_copyable`: trivial types (`int`, `double`, aggregates) move
+  with `memmove`/`memcpy`; non-trivial types (`std::string`) move element-wise so
+  internal self-pointers are never byte-copied.
+- **Leaf-aware sizing.** Leaves are a distinct, smaller node type that omits the
+  child-pointer array, so the ~99% of nodes that are leaves carry no wasted
+  storage — important for keeping large trees resident in cache at high orders.
+- **Per-tree slab allocator.** Nodes are carved from large slabs (one `malloc`
+  per slab, not per node) with a free-list for reuse, cutting allocator traffic
+  and improving locality. Teardown is O(#slabs) for trivially-destructible keys.
+- **Branchless in-node search.** For arithmetic keys the in-node position search
+  is a mispredict-free counting scan (which the compiler vectorizes) instead of a
+  branchy binary search, with O(1) append/prepend fast-paths so sorted insertion
+  stays cheap. Other key types keep `std::lower_bound`/`upper_bound`.
+- **Allocation-free iterators.** The iterator's traversal stack lives inline
+  (spilling to the heap only for pathologically deep trees), so `find()` and
+  `begin()` do no heap allocation.
+
+The default order is **64**, a cache-line-friendly fan-out in the measured sweet
+spot; any order `>= 3` remains supported and correct.
 
 ## API Reference
 
@@ -192,7 +224,7 @@ Takeaways:
 
 Template parameters:
 - `T` - Key type (must support comparison operators)
-- `Order` - B-tree order (default: 3)
+- `Order` - B-tree order (default: 64)
 
 #### Core Methods
 | Method | Complexity | Description |

@@ -350,6 +350,7 @@ int main(int argc, char* argv[]) {
         run_benchmarks_for_order<3>(n, random_data, seq_data);
         run_benchmarks_for_order<10>(n, random_data, seq_data);
         run_benchmarks_for_order<50>(n, random_data, seq_data);
+        run_benchmarks_for_order<64>(n, random_data, seq_data);  // default order
         run_benchmarks_for_order<100>(n, random_data, seq_data);
 
         run_set_benchmarks(n, random_data);
