@@ -168,6 +168,24 @@ You can specify custom sizes via command line:
 ./btree_benchmark 50000 200000
 ```
 
+### Sample Results
+
+Measured at **1,000,000 elements**, compiled with `g++ -O2` (GCC 16, Windows). Values are wall-clock **milliseconds for the whole batch of 1M operations — lower is better** (best of 3 runs). `std::set` is the red-black-tree baseline; its workload is random-order. Absolute numbers are machine-dependent, so treat the relative comparison as the takeaway.
+
+| Operation            | Order 3 | Order 10 | Order 50 | Order 100 | `std::set` |
+|----------------------|--------:|---------:|---------:|----------:|-----------:|
+| insert (random)      |  3049   |    794   |    422   |    360    |    1436    |
+| insert (sequential)  |   403   |    113   |     63   |     54    |     —      |
+| search               |  3295   |   1061   |    541   |    440    |    1530    |
+| find (iterator)      |  3519   |   1271   |    639   |    573    |    1523    |
+| iterate (full scan)  |   106   |     29   |    5.5   |    4.3    |     232    |
+| remove (random)      |  3781   |   1279   |    536   |    446    |    2044    |
+
+Takeaways:
+- **Higher orders are faster.** Larger nodes mean a shallower tree and fewer cache misses; the per-node binary search keeps in-node work cheap. Order 50–100 is the sweet spot for `int` keys.
+- **vs `std::set` at 1M (Order 100):** ~4× faster to build, ~3.5× faster to search, ~4.6× faster to remove, and **~54× faster** to iterate in sorted order — contiguous keys per node make the full scan far more cache-friendly than pointer-chasing a red-black tree.
+- **Order 3 is the slowest configuration** (deepest tree, most per-node overhead). It is correct for every operation, but choose a larger order when performance matters. The margins narrow at smaller sizes (10K/100K) but the ordering is the same.
+
 ## API Reference
 
 ### `BTree<T, Order>`
