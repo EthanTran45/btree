@@ -2,10 +2,14 @@
 
 #include <iostream>
 #include <vector>
-#include <stack>
 #include <stdexcept>
 #include <functional>
 #include <algorithm>
+#include <cstring>
+#include <cstdint>
+#include <new>
+#include <type_traits>
+#include <utility>
 
 // B-tree implementation with configurable order (any Order >= 3).
 //
@@ -14,38 +18,451 @@
 // underflowed nodes on the way back up. This keeps every node within
 // [min_keys, max_keys] and all leaves at the same depth for every order.
 //
+// Node storage is inline: each node holds its keys (and, for internal nodes,
+// its child pointers) in fixed-capacity buffers embedded in the node itself
+// (see InlineVec), so a node is a *single* heap allocation with its keys
+// co-resident with its header. Leaf nodes are a distinct, smaller type that
+// omits the child-pointer array entirely, so the ~99% of nodes that are leaves
+// carry no wasted storage. Together this roughly halves cache misses per level
+// versus a std::vector-per-node layout and removes two allocator round-trips
+// per node.
+//
 // Iterator Invalidation:
 // - insert(): Invalidates all iterators (may cause node splits/reallocations)
 // - remove(): Invalidates all iterators (may cause node merges/reallocations)
 // - clear(): Invalidates all iterators
 // - Iterators are safe to use only while the tree structure is unchanged.
 // - Unlike std::map/std::set, ALL iterators are invalidated on any mutation.
-template <typename T, int Order = 3>
+
+namespace btree_detail {
+
+// Fixed-capacity, inline-storage container exposing the subset of the
+// std::vector API the B-tree uses. Elements live in a buffer embedded in the
+// object (no separate heap allocation). All element relocation is gated on
+// std::is_trivially_copyable_v<U>: trivial types (int, double, aggregates like
+// Point, and Node* pointers) move with memmove/memcpy; non-trivial types
+// (std::string) move element-wise via their move/copy constructors so an
+// object's internal self-pointers are never byte-copied.
+template <typename U, int Cap>
+class InlineVec {
+    static_assert(Cap > 0, "InlineVec capacity must be positive");
+
+    alignas(U) unsigned char storage_[sizeof(U) * static_cast<std::size_t>(Cap)];
+    std::uint16_t size_ = 0;
+
+    U* data() noexcept { return std::launder(reinterpret_cast<U*>(storage_)); }
+    const U* data() const noexcept {
+        return std::launder(reinterpret_cast<const U*>(storage_));
+    }
+
+    void destroy_all() noexcept {
+        if constexpr (!std::is_trivially_destructible_v<U>) {
+            U* d = data();
+            for (std::uint16_t i = 0; i < size_; ++i) {
+                d[i].~U();
+            }
+        }
+    }
+
+public:
+    InlineVec() noexcept = default;
+    ~InlineVec() { destroy_all(); }
+
+    // Nodes are never copied or moved (the tree only moves the root pointer),
+    // so neither is InlineVec — deleting them prevents accidental byte-copies.
+    InlineVec(const InlineVec&) = delete;
+    InlineVec& operator=(const InlineVec&) = delete;
+    InlineVec(InlineVec&&) = delete;
+    InlineVec& operator=(InlineVec&&) = delete;
+
+    // Element access
+    U* begin() noexcept { return data(); }
+    U* end() noexcept { return data() + size_; }
+    const U* begin() const noexcept { return data(); }
+    const U* end() const noexcept { return data() + size_; }
+    U* raw() noexcept { return data(); }
+
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+
+    U& operator[](std::size_t i) noexcept { return data()[i]; }
+    const U& operator[](std::size_t i) const noexcept { return data()[i]; }
+    U& back() noexcept { return data()[size_ - 1]; }
+    const U& back() const noexcept { return data()[size_ - 1]; }
+
+    // Fixed capacity: reserve is a no-op, present only for API compatibility.
+    void reserve(std::size_t) noexcept {}
+
+    void clear() noexcept {
+        destroy_all();
+        size_ = 0;
+    }
+
+    void push_back(const U& value) {
+        ::new (static_cast<void*>(data() + size_)) U(value);
+        ++size_;
+    }
+    void push_back(U&& value) {
+        ::new (static_cast<void*>(data() + size_)) U(std::move(value));
+        ++size_;
+    }
+
+    void pop_back() noexcept {
+        --size_;
+        if constexpr (!std::is_trivially_destructible_v<U>) {
+            data()[size_].~U();
+        }
+    }
+
+    // Insert `value` before `pos`. Returns a pointer to the inserted element.
+    U* insert(const U* pos, const U& value) {
+        U* d = data();
+        std::size_t i = static_cast<std::size_t>(pos - d);
+        if constexpr (std::is_trivially_copyable_v<U>) {
+            std::memmove(d + i + 1, d + i, (size_ - i) * sizeof(U));
+            std::memcpy(static_cast<void*>(d + i), std::addressof(value), sizeof(U));
+        } else {
+            if (i == size_) {
+                ::new (static_cast<void*>(d + size_)) U(value);
+            } else {
+                // Open a gap: construct a new last slot from the current last,
+                // shift the interior up, then overwrite the vacated slot.
+                ::new (static_cast<void*>(d + size_)) U(std::move(d[size_ - 1]));
+                for (std::size_t j = size_ - 1; j > i; --j) {
+                    d[j] = std::move(d[j - 1]);
+                }
+                d[i] = value;
+            }
+        }
+        ++size_;
+        return d + i;
+    }
+
+    // Erase the element at `pos`. Returns a pointer to the following element.
+    U* erase(const U* pos) noexcept {
+        U* d = data();
+        std::size_t i = static_cast<std::size_t>(pos - d);
+        if constexpr (std::is_trivially_copyable_v<U>) {
+            std::memmove(d + i, d + i + 1, (size_ - i - 1) * sizeof(U));
+        } else {
+            for (std::size_t j = i; j + 1 < size_; ++j) {
+                d[j] = std::move(d[j + 1]);
+            }
+            d[size_ - 1].~U();
+        }
+        --size_;
+        return d + i;
+    }
+
+    // Shrink (destroying the tail) or grow (default-constructing). The B-tree
+    // only ever shrinks via resize (in split_child).
+    void resize(std::size_t n) {
+        U* d = data();
+        if (n < size_) {
+            if constexpr (!std::is_trivially_destructible_v<U>) {
+                for (std::size_t i = n; i < size_; ++i) {
+                    d[i].~U();
+                }
+            }
+        } else {
+            for (std::size_t i = size_; i < n; ++i) {
+                ::new (static_cast<void*>(d + i)) U();
+            }
+        }
+        size_ = static_cast<std::uint16_t>(n);
+    }
+
+    // Append `n` elements relocated from `src` (used by split/merge). Trivial
+    // types are memcpy'd; non-trivial types are move-constructed.
+    void append_move(U* src, std::size_t n) {
+        U* d = data() + size_;
+        if constexpr (std::is_trivially_copyable_v<U>) {
+            std::memcpy(static_cast<void*>(d), static_cast<const void*>(src), n * sizeof(U));
+        } else {
+            for (std::size_t i = 0; i < n; ++i) {
+                ::new (static_cast<void*>(d + i)) U(std::move(src[i]));
+            }
+        }
+        size_ = static_cast<std::uint16_t>(size_ + n);
+    }
+};
+
+// Slab allocator for fixed-size, fixed-alignment blocks with a free-list for
+// O(1) reuse. Blocks are carved sequentially from large slabs (one malloc per
+// slab instead of one per node), and freed blocks are recycled. This both cuts
+// allocator traffic and improves locality (nodes born together sit together).
+// One BTree owns one pool per node size class; it is moved with the tree and
+// released wholesale on teardown.
+class SlabPool {
+    void* free_list_ = nullptr;         // singly-linked recycled blocks
+    std::vector<void*> slabs_;          // raw slab allocations, freed on release()
+    char* bump_ = nullptr;              // next unused byte in the current slab
+    char* bump_end_ = nullptr;
+    std::size_t block_size_ = 0;
+    std::size_t block_align_ = 0;
+    std::size_t blocks_per_slab_ = 0;
+
+    void add_slab() {
+        std::size_t bytes = block_size_ * blocks_per_slab_;
+        void* slab = ::operator new(bytes, std::align_val_t(block_align_));
+        slabs_.push_back(slab);
+        bump_ = static_cast<char*>(slab);
+        bump_end_ = bump_ + bytes;
+    }
+
+    void move_from(SlabPool& o) noexcept {
+        free_list_ = o.free_list_;
+        slabs_ = std::move(o.slabs_);
+        bump_ = o.bump_;
+        bump_end_ = o.bump_end_;
+        block_size_ = o.block_size_;
+        block_align_ = o.block_align_;
+        blocks_per_slab_ = o.blocks_per_slab_;
+        o.free_list_ = nullptr;
+        o.bump_ = nullptr;
+        o.bump_end_ = nullptr;
+        // o keeps its size/align/blocks_per_slab config so it remains a usable
+        // (empty) pool after being moved from.
+    }
+
+public:
+    SlabPool() = default;
+    SlabPool(const SlabPool&) = delete;
+    SlabPool& operator=(const SlabPool&) = delete;
+    SlabPool(SlabPool&& o) noexcept { move_from(o); }
+    SlabPool& operator=(SlabPool&& o) noexcept {
+        if (this != &o) {
+            release();
+            move_from(o);
+        }
+        return *this;
+    }
+    ~SlabPool() { release(); }
+
+    // block_size must be >= sizeof(void*) (a free block stores the next pointer)
+    // and a multiple of block_align (so every carved block stays aligned).
+    void configure(std::size_t block_size, std::size_t block_align,
+                   std::size_t blocks_per_slab) noexcept {
+        block_size_ = block_size;
+        block_align_ = block_align;
+        blocks_per_slab_ = blocks_per_slab;
+    }
+
+    void* allocate() {
+        if (free_list_ != nullptr) {
+            void* p = free_list_;
+            free_list_ = *static_cast<void**>(p);
+            return p;
+        }
+        if (bump_ + block_size_ > bump_end_) {
+            add_slab();
+        }
+        void* p = bump_;
+        bump_ += block_size_;
+        return p;
+    }
+
+    void deallocate(void* p) noexcept {
+        *static_cast<void**>(p) = free_list_;
+        free_list_ = p;
+    }
+
+    // Free every slab at once (retains the size/align config so the pool can be
+    // reused afterwards, e.g. after clear()).
+    void release() noexcept {
+        for (void* s : slabs_) {
+            ::operator delete(s, std::align_val_t(block_align_));
+        }
+        slabs_.clear();
+        free_list_ = nullptr;
+        bump_ = nullptr;
+        bump_end_ = nullptr;
+    }
+};
+
+}  // namespace btree_detail
+
+// Default order 64: a cache-line-friendly fan-out that keeps the tree shallow
+// and the per-node branchless key scan short. Any Order >= 3 is supported and
+// correct; larger orders trade a little more per-node work for fewer levels.
+template <typename T, int Order = 64>
 class BTree {
 private:
+    // A leaf node: just its keys. Capacity Order matches the reactive design's
+    // transient overflow (a node may briefly hold Order keys before split_child
+    // runs on the recursion unwind). This bound is tight for every order incl. 3.
     struct Node {
-        std::vector<T> keys;
-        std::vector<Node*> children;
+        btree_detail::InlineVec<T, Order> keys;
         bool is_leaf;
-
-        Node(bool leaf = true) : is_leaf(leaf) {
-            // Pre-allocate to avoid reallocations. Reactive insert transiently
-            // holds Order keys / Order+1 children before splitting an overflow.
-            keys.reserve(Order);  // max_keys + 1 (transient overflow before split)
-            if (!leaf) {
-                children.reserve(Order + 1);  // max_keys + 2 (transient overflow)
-            }
-        }
-
-        ~Node() {
-            for (Node* child : children) {
-                delete child;
-            }
-        }
+        explicit Node(bool leaf = true) : is_leaf(leaf) {}
     };
+
+    // An internal node additionally owns child pointers. children.size() is
+    // always keys.size()+1; capacity Order+1 covers the transient overflow.
+    struct InternalNode : Node {
+        btree_detail::InlineVec<Node*, Order + 1> children;
+        InternalNode() : Node(false) {}
+    };
+
+    // Accessor for an internal node's children. Only valid when !n->is_leaf;
+    // every call site is guarded by an is_leaf check. Asserting that
+    // precondition to the optimizer both improves codegen and silences a GCC
+    // -Warray-bounds false positive (a leaf-sized allocation reached through the
+    // downcast looks like an out-of-bounds children access on an unreachable path).
+    static btree_detail::InlineVec<Node*, Order + 1>& ch(Node* n) noexcept {
+#if defined(__GNUC__)
+        if (n->is_leaf) { __builtin_unreachable(); }
+#endif
+        return static_cast<InternalNode*>(n)->children;
+    }
+
+    // In-node position search. For arithmetic keys a branchless counting scan
+    // (idx += comparison) avoids the data-dependent, mispredict-prone branches
+    // of std::lower_bound/upper_bound and streams the contiguous inline keys
+    // (GCC can vectorize it); for other key types we keep the binary search,
+    // which does fewer of the potentially-expensive comparisons. The two
+    // predicates are kept distinct (lower: k < key; upper: k <= key) to preserve
+    // multiset duplicate placement exactly as std::lower_bound/upper_bound did.
+    static size_t lower_index(const T* keys, size_t n, const T& key) {
+        if constexpr (std::is_arithmetic_v<T>) {
+            // O(1) boundary fast-paths: an append (key past the max) or prepend
+            // (key at/below the min) needs no scan. This keeps sequential/sorted
+            // insertion — where every key lands at the end — cheap, which the
+            // full linear scan would otherwise make O(Order) per node. Both
+            // branches are highly predictable, so the random path (which falls
+            // through to the mispredict-free scan) is unaffected.
+            if (n == 0 || key <= keys[0]) {
+                return 0;
+            }
+            if (keys[n - 1] < key) {
+                return n;
+            }
+            size_t idx = 0;
+            for (size_t k = 0; k < n; ++k) {
+                idx += (keys[k] < key);
+            }
+            return idx;
+        } else {
+            return static_cast<size_t>(std::lower_bound(keys, keys + n, key) - keys);
+        }
+    }
+
+    static size_t upper_index(const T* keys, size_t n, const T& key) {
+        if constexpr (std::is_arithmetic_v<T>) {
+            if (n == 0 || key < keys[0]) {
+                return 0;
+            }
+            if (keys[n - 1] <= key) {
+                return n;
+            }
+            size_t idx = 0;
+            for (size_t k = 0; k < n; ++k) {
+                idx += (keys[k] <= key);
+            }
+            return idx;
+        } else {
+            return static_cast<size_t>(std::upper_bound(keys, keys + n, key) - keys);
+        }
+    }
+
+    // Allocate a leaf or internal node of the right concrete type from the
+    // matching size-class pool, then construct it in place.
+    Node* make_node(bool leaf) {
+        if (leaf) {
+            return ::new (leaf_pool_.allocate()) Node(true);
+        }
+        return static_cast<Node*>(::new (internal_pool_.allocate()) InternalNode());
+    }
+
+    // Destroy a single node (running its true-type destructor) and return its
+    // block to the matching pool for reuse. Does NOT recurse into children.
+    void free_one(Node* n) noexcept {
+        if (n->is_leaf) {
+            n->~Node();
+            leaf_pool_.deallocate(n);
+        } else {
+            InternalNode* in = static_cast<InternalNode*>(n);
+            in->~InternalNode();
+            internal_pool_.deallocate(in);
+        }
+    }
+
+    // Run every node's destructor across a subtree (post-order). Used only on
+    // teardown, where the pools are released wholesale afterwards, so blocks are
+    // not returned to the free-list individually. Skipped entirely when T (hence
+    // the node types) is trivially destructible.
+    void destroy_subtree_dtors(Node* n) noexcept {
+        if (!n->is_leaf) {
+            InternalNode* in = static_cast<InternalNode*>(n);
+            for (Node* c : in->children) {
+                destroy_subtree_dtors(c);
+            }
+            in->~InternalNode();
+        } else {
+            n->~Node();
+        }
+    }
+
+    // Destroy all nodes then release both pools. A node's only non-trivial state
+    // is its keys, so when T is trivially destructible the per-node walk is a
+    // no-op and is elided — teardown becomes O(#slabs) instead of O(#nodes).
+    void destroy_all_nodes() noexcept {
+        if (root != nullptr) {
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                destroy_subtree_dtors(root);
+            }
+        }
+        leaf_pool_.release();
+        internal_pool_.release();
+    }
+
+    // Collapse an empty root after a removal: an internal root with no keys has
+    // exactly one child, which becomes the new root; a leaf root becomes empty.
+    // Kept out-of-line (noinline) so the optimizer analyses it with root of
+    // unknown leaf-ness — inlining it into single-leaf-tree call sites otherwise
+    // produces a -Warray-bounds false positive on the internal-root branch.
+#if defined(__GNUC__)
+    __attribute__((noinline))
+#endif
+    void shrink_root() noexcept {
+        Node* old_root = root;
+        if (root->is_leaf) {
+            root = nullptr;
+        } else {
+            root = ch(root)[0];  // promote the sole child (its subtree stays live)
+        }
+        free_one(old_root);  // frees only old_root; the promoted child stays live
+    }
+
+    // Size (in blocks) of each slab, aimed at ~128 KB per slab, min 16 blocks.
+    static constexpr std::size_t blocks_per_slab(std::size_t block_size) {
+        std::size_t n = (128u * 1024u) / block_size;
+        return n < 16 ? 16 : n;
+    }
+
+    // Round a node's size up to a block size that is >= sizeof(void*) (free-list
+    // link) and a multiple of the block alignment.
+    static constexpr std::size_t block_size_for(std::size_t sz, std::size_t align) {
+        std::size_t bs = sz < sizeof(void*) ? sizeof(void*) : sz;
+        return (bs + align - 1) / align * align;
+    }
+
+    static constexpr std::size_t leaf_align =
+        alignof(Node) < alignof(void*) ? alignof(void*) : alignof(Node);
+    static constexpr std::size_t internal_align =
+        alignof(InternalNode) < alignof(void*) ? alignof(void*) : alignof(InternalNode);
+    static constexpr std::size_t leaf_block = block_size_for(sizeof(Node), leaf_align);
+    static constexpr std::size_t internal_block = block_size_for(sizeof(InternalNode), internal_align);
+
+    void configure_pools() noexcept {
+        leaf_pool_.configure(leaf_block, leaf_align, blocks_per_slab(leaf_block));
+        internal_pool_.configure(internal_block, internal_align, blocks_per_slab(internal_block));
+    }
 
     Node* root;
     size_t size_;
+    btree_detail::SlabPool leaf_pool_;      // blocks sized for Node
+    btree_detail::SlabPool internal_pool_;  // blocks sized for InternalNode
     static constexpr int max_keys = Order - 1;
     static constexpr int min_keys = (Order - 1) / 2;
 
@@ -57,7 +474,48 @@ public:
             Node* node;
             size_t index;  // Next key index to visit
         };
-        std::stack<StackFrame, std::vector<StackFrame>> stack_;  // Vector-backed for cache locality
+
+        // Allocation-free path stack. Tree height is O(log n): the inline
+        // capacity covers an order-3 tree up to ~2^31 elements without touching
+        // the heap; deeper trees spill to a vector, preserving the documented
+        // "billions of elements" contract. Making the common case allocation-free
+        // removes the per-find()/per-begin() malloc+free.
+        class PathStack {
+            static constexpr size_t kInline = 32;
+            StackFrame inline_[kInline];
+            std::vector<StackFrame> heap_;  // used only after spilling
+            size_t depth_ = 0;
+            bool spilled_ = false;
+
+        public:
+            bool empty() const noexcept { return depth_ == 0; }
+
+            void push(const StackFrame& f) {
+                if (!spilled_ && depth_ < kInline) {
+                    inline_[depth_++] = f;
+                    return;
+                }
+                if (!spilled_) {  // inline buffer full: move everything to the heap
+                    heap_.assign(inline_, inline_ + kInline);
+                    spilled_ = true;
+                }
+                heap_.push_back(f);
+                ++depth_;
+            }
+
+            StackFrame& top() noexcept {
+                return spilled_ ? heap_.back() : inline_[depth_ - 1];
+            }
+
+            void pop() noexcept {
+                --depth_;
+                if (spilled_) {
+                    heap_.pop_back();
+                }
+            }
+        };
+
+        PathStack stack_;
         const T* current_;
 
         void push_left_path(Node* node) {
@@ -66,7 +524,7 @@ public:
                 if (node->is_leaf) {
                     break;
                 }
-                node = node->children[0];
+                node = BTree::ch(node)[0];
             }
         }
 
@@ -79,8 +537,8 @@ public:
                     frame.index++;
 
                     // If not a leaf, go to right child of current key
-                    if (!frame.node->is_leaf && frame.index < frame.node->children.size()) {
-                        Node* right_child = frame.node->children[frame.index];
+                    if (!frame.node->is_leaf && frame.index < BTree::ch(frame.node).size()) {
+                        Node* right_child = BTree::ch(frame.node)[frame.index];
                         push_left_path(right_child);
                     }
                     return;
@@ -104,11 +562,6 @@ public:
         }
 
         explicit iterator(Node* root) : current_(nullptr) {
-            // Pre-allocate stack for typical tree heights (handles billions of elements)
-            std::vector<StackFrame> container;
-            container.reserve(32);
-            stack_ = std::stack<StackFrame, std::vector<StackFrame>>(std::move(container));
-
             if (root != nullptr) {
                 push_left_path(root);
                 advance();
@@ -149,48 +602,52 @@ private:
     // the new right node gets the rest. Valid for every order: left ends with
     // floor(Order/2) keys and right with exactly min_keys keys.
     void split_child(Node* parent, size_t index) {
-        Node* full_child = parent->children[index];
-        Node* new_node = new Node(full_child->is_leaf);
+        Node* full_child = ch(parent)[index];
+        Node* new_node = make_node(full_child->is_leaf);
 
         size_t mid = full_child->keys.size() / 2;
-        T mid_key = full_child->keys[mid];
+        T mid_key = std::move(full_child->keys[mid]);  // median moves up to the parent
 
-        new_node->keys.assign(full_child->keys.begin() + mid + 1, full_child->keys.end());
-        full_child->keys.resize(mid);
-
+        // Relocate the upper half (mid+1 .. end) into the new right node.
+        new_node->keys.append_move(full_child->keys.raw() + mid + 1,
+                                   full_child->keys.size() - (mid + 1));
         if (!full_child->is_leaf) {
-            new_node->children.assign(full_child->children.begin() + mid + 1, full_child->children.end());
-            full_child->children.resize(mid + 1);
+            ch(new_node).append_move(ch(full_child).raw() + mid + 1,
+                                     ch(full_child).size() - (mid + 1));
+        }
+
+        // Drop the median (now moved-from) and the relocated tail from the left.
+        full_child->keys.resize(mid);
+        if (!full_child->is_leaf) {
+            ch(full_child).resize(mid + 1);
         }
 
         parent->keys.insert(parent->keys.begin() + index, mid_key);
-        parent->children.insert(parent->children.begin() + index + 1, new_node);
+        ch(parent).insert(ch(parent).begin() + index + 1, new_node);
     }
 
     // Reactive insert: descend to the target leaf and insert there, then split
     // the child on the way back up if it overflowed past max_keys.
     void insert_rec(Node* node, const T& key) {
         if (node->is_leaf) {
-            // Binary search for insertion position (duplicates allowed).
-            auto pos = std::lower_bound(node->keys.begin(), node->keys.end(), key);
-            node->keys.insert(pos, key);
+            // Search for insertion position (duplicates allowed).
+            size_t i = lower_index(node->keys.begin(), node->keys.size(), key);
+            node->keys.insert(node->keys.begin() + i, key);
             return;
         }
-        // upper_bound places a new duplicate after existing equal keys.
-        auto pos = std::upper_bound(node->keys.begin(), node->keys.end(), key);
-        size_t i = pos - node->keys.begin();
+        // upper_index places a new duplicate after existing equal keys.
+        size_t i = upper_index(node->keys.begin(), node->keys.size(), key);
 
-        insert_rec(node->children[i], key);
+        insert_rec(ch(node)[i], key);
 
-        if (node->children[i]->keys.size() > static_cast<size_t>(max_keys)) {
+        if (ch(node)[i]->keys.size() > static_cast<size_t>(max_keys)) {
             split_child(node, i);
         }
     }
 
     Node* search_node(Node* node, const T& key) const {
-        // Binary search for key position
-        auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
-        size_t i = it - node->keys.begin();
+        // Search for key position
+        size_t i = lower_index(node->keys.begin(), node->keys.size(), key);
 
         if (i < node->keys.size() && node->keys[i] == key) {
             return node;
@@ -200,20 +657,20 @@ private:
             return nullptr;
         }
 
-        return search_node(node->children[i], key);
+        return search_node(ch(node)[i], key);
     }
 
     void traverse_node(Node* node) const {
         size_t i;
         for (i = 0; i < node->keys.size(); i++) {
             if (!node->is_leaf) {
-                traverse_node(node->children[i]);
+                traverse_node(ch(node)[i]);
             }
             std::cout << node->keys[i] << " ";
         }
 
         if (!node->is_leaf) {
-            traverse_node(node->children[i]);
+            traverse_node(ch(node)[i]);
         }
     }
 
@@ -221,13 +678,13 @@ private:
         size_t i;
         for (i = 0; i < node->keys.size(); i++) {
             if (!node->is_leaf) {
-                traverse_node(node->children[i], os);
+                traverse_node(ch(node)[i], os);
             }
             os << node->keys[i] << " ";
         }
 
         if (!node->is_leaf) {
-            traverse_node(node->children[i], os);
+            traverse_node(ch(node)[i], os);
         }
     }
 
@@ -238,7 +695,7 @@ private:
         if (node->is_leaf) {
             return 1;
         }
-        return 1 + calculate_height(node->children[0]);
+        return 1 + calculate_height(ch(node)[0]);
     }
 
     template<typename Func>
@@ -246,51 +703,50 @@ private:
         size_t i;
         for (i = 0; i < node->keys.size(); i++) {
             if (!node->is_leaf) {
-                for_each_node(node->children[i], f);
+                for_each_node(ch(node)[i], f);
             }
             f(node->keys[i]);
         }
 
         if (!node->is_leaf) {
-            for_each_node(node->children[i], f);
+            for_each_node(ch(node)[i], f);
         }
     }
 
     const T& get_predecessor(Node* node) const {
         while (!node->is_leaf) {
-            node = node->children.back();
+            node = ch(node).back();
         }
         return node->keys.back();
     }
 
     const T& get_successor(Node* node) const {
         while (!node->is_leaf) {
-            node = node->children[0];
+            node = ch(node)[0];
         }
         return node->keys[0];
     }
 
     void merge_children(Node* node, size_t idx) {
-        Node* left = node->children[idx];
-        Node* right = node->children[idx + 1];
+        Node* left = ch(node)[idx];
+        Node* right = ch(node)[idx + 1];
 
-        // Reserve space and bulk-insert to avoid multiple reallocations
-        left->keys.reserve(left->keys.size() + 1 + right->keys.size());
-        left->keys.push_back(node->keys[idx]);
-        left->keys.insert(left->keys.end(), right->keys.begin(), right->keys.end());
+        // Bring the separator down, then relocate all of right's contents onto
+        // the end of left (append_move memcpy's for trivial T, moves otherwise).
+        left->keys.push_back(std::move(node->keys[idx]));
+        left->keys.append_move(right->keys.raw(), right->keys.size());
 
         if (!left->is_leaf) {
-            left->children.reserve(left->children.size() + right->children.size());
-            left->children.insert(left->children.end(), right->children.begin(), right->children.end());
+            ch(left).append_move(ch(right).raw(), ch(right).size());
+            ch(right).clear();  // detach transferred children so they aren't freed
         }
 
         // Remove key from parent
         node->keys.erase(node->keys.begin() + idx);
-        node->children.erase(node->children.begin() + idx + 1);
+        ch(node).erase(ch(node).begin() + idx + 1);
 
-        // Delete right node (but not its children, as they're now in left)
-        right->children.clear();
-        delete right;
+        // Free the now-empty right node (its children, if any, moved to left)
+        free_one(right);
         // No overflow is possible: reactive delete only merges an underflowed
         // child (min_keys-1 keys) with a minimum sibling (min_keys keys), giving
         // 2*min_keys <= max_keys keys for every order.
@@ -300,21 +756,21 @@ private:
     // left it with fewer than min_keys keys: borrow from a sibling that can
     // spare a key, otherwise merge with an adjacent sibling.
     void fix_underflow(Node* node, size_t idx) {
-        if (node->children[idx]->keys.size() >= static_cast<size_t>(min_keys)) {
+        if (ch(node)[idx]->keys.size() >= static_cast<size_t>(min_keys)) {
             return;  // no underflow
         }
         // Try to borrow from left sibling
-        if (idx > 0 && node->children[idx - 1]->keys.size() > static_cast<size_t>(min_keys)) {
+        if (idx > 0 && ch(node)[idx - 1]->keys.size() > static_cast<size_t>(min_keys)) {
             borrow_from_prev(node, idx);
         }
         // Try to borrow from right sibling
-        else if (idx < node->children.size() - 1 &&
-                 node->children[idx + 1]->keys.size() > static_cast<size_t>(min_keys)) {
+        else if (idx < ch(node).size() - 1 &&
+                 ch(node)[idx + 1]->keys.size() > static_cast<size_t>(min_keys)) {
             borrow_from_next(node, idx);
         }
         // Merge with a sibling
         else {
-            if (idx < node->children.size() - 1) {
+            if (idx < ch(node).size() - 1) {
                 merge_children(node, idx);       // merge with right sibling
             } else {
                 merge_children(node, idx - 1);   // rightmost child: merge into left
@@ -323,8 +779,8 @@ private:
     }
 
     void borrow_from_prev(Node* node, size_t idx) {
-        Node* child = node->children[idx];
-        Node* sibling = node->children[idx - 1];
+        Node* child = ch(node)[idx];
+        Node* sibling = ch(node)[idx - 1];
 
         // Shift all keys in child one step ahead
         child->keys.insert(child->keys.begin(), node->keys[idx - 1]);
@@ -335,14 +791,14 @@ private:
 
         // Move child pointer if not leaf
         if (!child->is_leaf) {
-            child->children.insert(child->children.begin(), sibling->children.back());
-            sibling->children.pop_back();
+            ch(child).insert(ch(child).begin(), ch(sibling).back());
+            ch(sibling).pop_back();
         }
     }
 
     void borrow_from_next(Node* node, size_t idx) {
-        Node* child = node->children[idx];
-        Node* sibling = node->children[idx + 1];
+        Node* child = ch(node)[idx];
+        Node* sibling = ch(node)[idx + 1];
 
         // Move key from parent to child
         child->keys.push_back(node->keys[idx]);
@@ -353,8 +809,8 @@ private:
 
         // Move child pointer if not leaf
         if (!child->is_leaf) {
-            child->children.push_back(sibling->children[0]);
-            sibling->children.erase(sibling->children.begin());
+            ch(child).push_back(ch(sibling)[0]);
+            ch(sibling).erase(ch(sibling).begin());
         }
     }
 
@@ -362,8 +818,7 @@ private:
     // internal key with its in-leaf predecessor first), then repair any child that
     // underflowed on the way back up. Returns true if the key was found.
     bool remove_rec(Node* node, const T& key) {
-        auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
-        size_t idx = it - node->keys.begin();
+        size_t idx = lower_index(node->keys.begin(), node->keys.size(), key);
         bool here = (idx < node->keys.size() && node->keys[idx] == key);
 
         if (node->is_leaf) {
@@ -380,14 +835,14 @@ private:
             // Internal key: overwrite it with its in-leaf predecessor (the rightmost
             // key of the left subtree), then delete that predecessor from the leaf.
             // Copy by value: the recursive delete below mutates the source leaf.
-            T pred = get_predecessor(node->children[idx]);
+            T pred = get_predecessor(ch(node)[idx]);
             node->keys[idx] = pred;
             child_idx = idx;
-            removed = remove_rec(node->children[child_idx], pred);
+            removed = remove_rec(ch(node)[child_idx], pred);
         } else {
             // lower_bound points at the subtree that may contain the key.
             child_idx = idx;
-            removed = remove_rec(node->children[child_idx], key);
+            removed = remove_rec(ch(node)[child_idx], key);
         }
 
         if (removed) {
@@ -396,30 +851,19 @@ private:
         return removed;
     }
 
-    // Helper to find a key and build iterator stack
+    // Helper to find a key and build iterator stack. The ancestor path is pushed
+    // directly onto the result iterator's inline stack as we descend (no separate
+    // container, no allocation on the found path).
     iterator find_impl(const T& key) const {
-        if (root == nullptr) {
-            return iterator();
-        }
-
-        // Pre-allocate stack for typical tree heights
-        std::vector<typename iterator::StackFrame> path_container;
-        path_container.reserve(32);
-        std::stack<typename iterator::StackFrame, std::vector<typename iterator::StackFrame>> path(std::move(path_container));
+        iterator result;  // empty stack, current_ == nullptr (i.e. end())
         Node* node = root;
 
         while (node != nullptr) {
-            auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
-            size_t i = it - node->keys.begin();
+            size_t i = lower_index(node->keys.begin(), node->keys.size(), key);
 
             if (i < node->keys.size() && node->keys[i] == key) {
-                // Found the key - build iterator at this position
-                // Push current node with index pointing to the found key
-                path.push({node, i});
-
-                // Create iterator and set its state
-                iterator result;
-                result.stack_ = std::move(path);
+                // Found the key - point the iterator at this position.
+                result.stack_.push({node, i});
                 result.current_ = &node->keys[i];
 
                 // Advance index for next iteration
@@ -427,12 +871,12 @@ private:
                 frame.index++;
 
                 // If not a leaf, push left path of right subtree
-                if (!node->is_leaf && frame.index < node->children.size()) {
-                    Node* right_child = node->children[frame.index];
+                if (!node->is_leaf && frame.index < ch(node).size()) {
+                    Node* right_child = ch(node)[frame.index];
                     while (right_child != nullptr) {
                         result.stack_.push({right_child, 0});
                         if (right_child->is_leaf) break;
-                        right_child = right_child->children[0];
+                        right_child = ch(right_child)[0];
                     }
                 }
 
@@ -443,26 +887,33 @@ private:
                 return iterator();  // Not found
             }
 
-            path.push({node, i});
-            node = node->children[i];
+            result.stack_.push({node, i});
+            node = ch(node)[i];
         }
 
         return iterator();
     }
 
 public:
-    BTree() : root(nullptr), size_(0) {}
+    BTree() : root(nullptr), size_(0) {
+        configure_pools();
+    }
 
     ~BTree() {
-        delete root;
+        destroy_all_nodes();
     }
 
     // Prevent copying (would cause double-free)
     BTree(const BTree&) = delete;
     BTree& operator=(const BTree&) = delete;
 
-    // Move constructor
-    BTree(BTree&& other) noexcept : root(other.root), size_(other.size_) {
+    // Move constructor - the node pools move with the tree so the moved-to tree
+    // owns the storage its nodes live in.
+    BTree(BTree&& other) noexcept
+        : root(other.root),
+          size_(other.size_),
+          leaf_pool_(std::move(other.leaf_pool_)),
+          internal_pool_(std::move(other.internal_pool_)) {
         other.root = nullptr;
         other.size_ = 0;
     }
@@ -470,9 +921,11 @@ public:
     // Move assignment
     BTree& operator=(BTree&& other) noexcept {
         if (this != &other) {
-            delete root;
+            destroy_all_nodes();
             root = other.root;
             size_ = other.size_;
+            leaf_pool_ = std::move(other.leaf_pool_);
+            internal_pool_ = std::move(other.internal_pool_);
             other.root = nullptr;
             other.size_ = 0;
         }
@@ -482,7 +935,7 @@ public:
     // O(log n) - Insert a key into the tree
     void insert(const T& key) {
         if (root == nullptr) {
-            root = new Node(true);
+            root = make_node(true);
             root->keys.push_back(key);
             size_++;
             return;
@@ -492,8 +945,8 @@ public:
 
         // If the root overflowed, grow a new root above it and split.
         if (root->keys.size() > static_cast<size_t>(max_keys)) {
-            Node* new_root = new Node(false);
-            new_root->children.push_back(root);
+            Node* new_root = make_node(false);
+            ch(new_root).push_back(root);
             split_child(new_root, 0);
             root = new_root;
         }
@@ -511,16 +964,10 @@ public:
 
         if (removed) {
             size_--;
-            // If root has no keys left, make its first child the new root
+            // If root has no keys left, promote its child (internal) or empty
+            // the tree (leaf). Handled in an out-of-line helper (see comment).
             if (root->keys.empty()) {
-                Node* old_root = root;
-                if (root->is_leaf) {
-                    root = nullptr;
-                } else {
-                    root = root->children[0];
-                }
-                old_root->children.clear();  // Prevent recursive deletion
-                delete old_root;
+                shrink_root();
             }
         }
 
@@ -573,7 +1020,7 @@ public:
 
     // O(n) - Remove all elements from the tree
     void clear() noexcept {
-        delete root;
+        destroy_all_nodes();
         root = nullptr;
         size_ = 0;
     }
@@ -590,7 +1037,7 @@ public:
         }
         Node* node = root;
         while (!node->is_leaf) {
-            node = node->children[0];
+            node = ch(node)[0];
         }
         return node->keys[0];
     }
@@ -602,7 +1049,7 @@ public:
         }
         Node* node = root;
         while (!node->is_leaf) {
-            node = node->children.back();
+            node = ch(node).back();
         }
         return node->keys.back();
     }
