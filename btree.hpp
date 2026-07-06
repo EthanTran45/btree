@@ -237,6 +237,7 @@ class SlabPool {
     std::size_t block_size_ = 0;
     std::size_t block_align_ = 0;
     std::size_t blocks_per_slab_ = 0;
+    std::size_t free_count_ = 0;        // blocks currently on free_list_ (for reserve())
 
     void add_slab() {
         std::size_t bytes = block_size_ * blocks_per_slab_;
@@ -259,9 +260,11 @@ class SlabPool {
         block_size_ = o.block_size_;
         block_align_ = o.block_align_;
         blocks_per_slab_ = o.blocks_per_slab_;
+        free_count_ = o.free_count_;
         o.free_list_ = nullptr;
         o.bump_ = nullptr;
         o.bump_end_ = nullptr;
+        o.free_count_ = 0;
         // o keeps its size/align/blocks_per_slab config so it remains a usable
         // (empty) pool after being moved from.
     }
@@ -293,6 +296,7 @@ public:
         if (free_list_ != nullptr) {
             void* p = free_list_;
             free_list_ = *static_cast<void**>(p);
+            --free_count_;
             return p;
         }
         // Check remaining capacity without forming an invalid pointer. When the
@@ -313,6 +317,29 @@ public:
     void deallocate(void* p) noexcept {
         *static_cast<void**>(p) = free_list_;
         free_list_ = p;
+        ++free_count_;
+    }
+
+    // Ensure the next `n` allocate() calls are satisfied from the free-list, so
+    // each is guaranteed not to reach ::operator new (hence cannot throw). Any
+    // block growth this requires happens here, up front: callers use it to hoist
+    // a would-be-mid-mutation allocation to a pre-commit point where a throw is
+    // still harmless. May throw bad_alloc, but only from within this call.
+    void reserve(std::size_t n) {
+        while (free_count_ < n) {
+            // Carve one block (from the current slab, or a fresh one) and park it
+            // on the free-list. Mirrors allocate()'s bump-region capacity check,
+            // including the null-slab short-circuit that avoids forming an invalid
+            // pointer. Works across slab boundaries, so n may exceed a slab's
+            // block count (e.g. a tall order-3 tree needing height reservations).
+            if (bump_ == nullptr ||
+                static_cast<std::size_t>(bump_end_ - bump_) < block_size_) {
+                add_slab();
+            }
+            void* p = bump_;
+            bump_ += block_size_;
+            deallocate(p);  // pushes onto free_list_ and bumps free_count_
+        }
     }
 
     // Free every slab at once (retains the size/align config so the pool can be
@@ -325,6 +352,7 @@ public:
         free_list_ = nullptr;
         bump_ = nullptr;
         bump_end_ = nullptr;
+        free_count_ = 0;
     }
 };
 
@@ -490,6 +518,7 @@ private:
             root = ch(root)[0];  // promote the sole child (its subtree stays live)
         }
         free_one(old_root);  // frees only old_root; the promoted child stays live
+        --height_;           // both branches drop the tree by exactly one level
     }
 
     // Size (in blocks) of each slab, aimed at ~128 KB per slab, min 16 blocks.
@@ -519,6 +548,11 @@ private:
 
     Node* root;
     size_t size_;
+    // Tree height in levels (0 when empty), maintained incrementally so insert()
+    // can size its pre-split node reservation without an extra root-to-leaf
+    // descent: it grows by 1 when a new root is created and shrinks by 1 when the
+    // root collapses. height() returns it directly.
+    size_t height_;
     btree_detail::SlabPool leaf_pool_;      // blocks sized for Node
     btree_detail::SlabPool internal_pool_;  // blocks sized for InternalNode
     static constexpr int max_keys = Order - 1;
@@ -758,16 +792,6 @@ private:
         }
     }
 
-    size_t calculate_height(Node* node) const noexcept {
-        if (node == nullptr) {
-            return 0;
-        }
-        if (node->is_leaf) {
-            return 1;
-        }
-        return 1 + calculate_height(ch(node)[0]);
-    }
-
     template<typename Func>
     void for_each_node(Node* node, Func& f) const {
         size_t i;
@@ -992,7 +1016,7 @@ private:
     }
 
 public:
-    BTree() : root(nullptr), size_(0) {
+    BTree() : root(nullptr), size_(0), height_(0) {
         configure_pools();
     }
 
@@ -1009,10 +1033,12 @@ public:
     BTree(BTree&& other) noexcept
         : root(other.root),
           size_(other.size_),
+          height_(other.height_),
           leaf_pool_(std::move(other.leaf_pool_)),
           internal_pool_(std::move(other.internal_pool_)) {
         other.root = nullptr;
         other.size_ = 0;
+        other.height_ = 0;
     }
 
     // Move assignment
@@ -1021,10 +1047,12 @@ public:
             destroy_all_nodes();
             root = other.root;
             size_ = other.size_;
+            height_ = other.height_;
             leaf_pool_ = std::move(other.leaf_pool_);
             internal_pool_ = std::move(other.internal_pool_);
             other.root = nullptr;
             other.size_ = 0;
+            other.height_ = 0;
         }
         return *this;
     }
@@ -1046,7 +1074,31 @@ public:
             }
             root = n;
             size_++;
+            height_ = 1;
             return;
+        }
+
+        // Pre-reserve every node the split cascade could allocate, BEFORE the key
+        // is committed to a leaf. A single insert splits at most the one target
+        // leaf (one new leaf) and, in the worst case, one node at every level up
+        // to and including a freshly grown root (at most height()+1 new internal
+        // nodes). Carving those blocks onto the pools' free-lists up front means
+        // every make_node() on the recursion unwind reuses a block and never calls
+        // ::operator new -- so once insert_rec() commits the key, no remaining step
+        // can throw. If a reservation itself throws bad_alloc, the tree has not
+        // been mutated yet, so insert()'s strong exception guarantee holds. Without
+        // this, a bad_alloc from a split's make_node would leave a node holding
+        // max_keys+1 keys -- an over-capacity, corrupt node -- with size_ uncounted.
+        leaf_pool_.reserve(1);
+        // Reserve internal blocks only when this insert could actually create one.
+        // A single-leaf root grows an internal root only if the insert overflows
+        // it; reserving otherwise would eagerly allocate an internal slab a small
+        // tree never needs. An internal tree can cascade a split up every level
+        // and grow a new root: at most height_ new internal nodes (+1 margin).
+        if (!root->is_leaf) {
+            internal_pool_.reserve(height_ + 1);
+        } else if (root->keys.size() >= static_cast<size_t>(max_keys)) {
+            internal_pool_.reserve(1);
         }
 
         insert_rec(root, key);
@@ -1057,6 +1109,7 @@ public:
             ch(new_root).push_back(root);
             split_child(new_root, 0);
             root = new_root;
+            ++height_;
         }
 
         size_++;
@@ -1132,11 +1185,12 @@ public:
         destroy_all_nodes();
         root = nullptr;
         size_ = 0;
+        height_ = 0;
     }
 
-    // O(log n) - Return the height of the tree (0 for empty tree)
+    // O(1) - Return the height of the tree (0 for empty tree)
     [[nodiscard]] size_t height() const noexcept {
-        return calculate_height(root);
+        return height_;
     }
 
     // O(log n) - Return the minimum element. Throws if tree is empty.
