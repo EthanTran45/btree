@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <climits>
 #include <set>
+#include <cstdlib>
+#include <new>
 
 // Include the BTree implementation
 #include "btree.hpp"
@@ -2604,6 +2606,152 @@ TEST(test_remove_rebalance_throw_strong) {
     ASSERT_EQ(Thrower::live, 0L);  // no leak on any throwing path
 }
 
+// === insert() strong exception-safety under allocation failure ===
+//
+// insert() commits the key into a leaf and then splits any overflowed nodes on
+// the recursion unwind, and those splits allocate nodes. Historically, if a
+// split's make_node() threw std::bad_alloc *after* the key was committed, the
+// tree was left with an over-capacity node (max_keys+1 keys) and an uncounted
+// size_ -- a corrupt state that a later insert would turn into an out-of-bounds
+// write past a node's fixed InlineVec storage. insert() now pre-reserves the
+// entire split cascade before committing, so an allocation failure can only
+// strike at that pre-commit reservation and leaves the tree exactly as it was.
+//
+// This test injects bad_alloc at *every* allocation point reached during a build
+// and, for each, asserts the strong guarantee: the tree holds exactly the keys
+// that were successfully inserted before the failing insert, with a consistent
+// size(), and remains fully usable afterwards (finishing the build yields the
+// complete, correct set with no latent corruption).
+
+// Fail-injection hook on the ALIGNED operator new only. That is exactly (and
+// only) what SlabPool uses for node slabs -- it calls ::operator new(bytes,
+// align_val_t) explicitly -- so this intercepts every BTree heap allocation
+// while touching nothing else in the program. We deliberately do NOT replace the
+// ordinary operator new/delete: std::string / std::stringstream buffers can be
+// allocated inside the shared libstdc++ runtime and then freed via a delete that
+// -O2 inlines into this TU, mixing two heaps and corrupting on free. char and
+// other max-aligned types never use the aligned new, so the aligned-only hook
+// sidesteps that entirely. The pool's aligned new/delete are both emitted into
+// this TU (btree.hpp is header-only), so they pair consistently.
+//
+// While armed, the g_alloc_countdown-th slab allocation throws bad_alloc;
+// otherwise it is a malloc pass-through. (g_alloc_armed has static/zero init, so
+// it is false before any dynamic initialization that might allocate.) std::malloc
+// returns max_align_t (>=16 byte) storage, which covers every node alignment the
+// suite uses (int/double/string/Thrower all need <= 16); an over-aligned key type
+// would need real aligned allocation here.
+static bool g_alloc_armed = false;
+static long g_alloc_countdown = 0;
+static long g_alloc_hits = 0;  // armed slab allocations seen (whether or not they threw)
+
+static void* test_slab_alloc(std::size_t n, std::size_t align) {
+    (void)align;  // see note above: max_align_t storage suffices for this suite
+    if (g_alloc_armed) {
+        ++g_alloc_hits;
+        if (--g_alloc_countdown < 0) throw std::bad_alloc();
+    }
+    void* p = std::malloc(n ? n : 1);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new(std::size_t n, std::align_val_t a) {
+    return test_slab_alloc(n, static_cast<std::size_t>(a));
+}
+void* operator new[](std::size_t n, std::align_val_t a) {
+    return test_slab_alloc(n, static_cast<std::size_t>(a));
+}
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+
+// RAII arm/disarm so the hook is ALWAYS disarmed on scope exit -- even if an
+// unexpected exception unwinds through the armed region -- and can never leak
+// its armed state into a later test.
+struct AllocFailGuard {
+    explicit AllocFailGuard(long countdown) {
+        g_alloc_hits = 0;
+        g_alloc_countdown = countdown;
+        g_alloc_armed = true;
+    }
+    ~AllocFailGuard() { g_alloc_armed = false; }
+    AllocFailGuard(const AllocFailGuard&) = delete;
+    AllocFailGuard& operator=(const AllocFailGuard&) = delete;
+};
+
+// Build 0..M-1 into a fresh Order tree, injecting a bad_alloc at the `target`-th
+// allocation; verify the strong guarantee holds after the throw. Sweeps `target`
+// over every allocation the build performs. Returns the number of injected
+// throws actually exercised (so the caller can assert coverage was non-vacuous).
+template <int Order>
+static long insert_alloc_fail_sweep(int M) {
+    // First, an un-injected armed build to count how many allocation points exist.
+    // LONG_MAX countdown never reaches zero, so this build cannot throw.
+    long total_allocs;
+    {
+        BTree<int, Order> t;
+        AllocFailGuard guard(LONG_MAX);
+        for (int k = 0; k < M; ++k) t.insert(k);
+        total_allocs = g_alloc_hits;
+    }
+
+    long throws_seen = 0;
+    for (long target = 0; target <= total_allocs; ++target) {
+        BTree<int, Order> t;
+        int succeeded = 0;
+        bool threw = false;
+
+        {
+            AllocFailGuard guard(target);
+            for (int k = 0; k < M; ++k) {
+                try {
+                    t.insert(k);
+                    ++succeeded;
+                } catch (const std::bad_alloc&) {
+                    threw = true;
+                    break;
+                }
+            }
+        }  // guard disarms the hook here, before any allocating assertion below
+        if (threw) ++throws_seen;
+
+        // Strong guarantee: exactly {0 .. succeeded-1}, in order, size() consistent.
+        // (Pre-fix, a split that threw left an extra committed-but-uncounted key,
+        // so the in-order element count would exceed size().)
+        ASSERT_EQ(t.size(), static_cast<size_t>(succeeded));
+        long iterated = 0;
+        for (int v : t) {
+            ASSERT_EQ(v, static_cast<int>(iterated));
+            ++iterated;
+        }
+        ASSERT_EQ(iterated, static_cast<long>(succeeded));
+
+        // No latent corruption: finish the build with the allocator healthy and
+        // confirm the full, correct set (pre-fix this path overran a node buffer).
+        for (int k = succeeded; k < M; ++k) t.insert(k);
+        ASSERT_EQ(t.size(), static_cast<size_t>(M));
+        int expect = 0;
+        for (int v : t) { ASSERT_EQ(v, expect); ++expect; }
+        ASSERT_EQ(expect, M);
+    }
+    return throws_seen;
+}
+
+TEST(test_insert_strong_exception_safety_alloc_fail) {
+    long throws = 0;
+    throws += insert_alloc_fail_sweep<3>(300);
+    throws += insert_alloc_fail_sweep<4>(300);
+    throws += insert_alloc_fail_sweep<5>(300);
+    throws += insert_alloc_fail_sweep<64>(800);
+    throws += insert_alloc_fail_sweep<3>(6000);  // tall tree: inject across slab
+                                                 // boundaries reached mid-build
+    // The injected-failure path must actually have fired (else the test would
+    // pass vacuously if insert() stopped allocating during splits).
+    ASSERT_TRUE(throws > 0);
+    // The hook must be disarmed so it cannot perturb any later test.
+    ASSERT_FALSE(g_alloc_armed);
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -2635,6 +2783,7 @@ int main() {
     RUN_TEST(test_remove_reverse);
     RUN_TEST(test_remove_strong_exception_safety);
     RUN_TEST(test_remove_rebalance_throw_strong);
+    RUN_TEST(test_insert_strong_exception_safety_alloc_fail);
     RUN_TEST(test_move_constructor);
     RUN_TEST(test_move_assignment);
     RUN_TEST(test_stress_insert_remove);
