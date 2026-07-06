@@ -692,7 +692,7 @@ private:
             ch(full_child).resize(mid + 1);
         }
 
-        parent->keys.insert(parent->keys.begin() + index, mid_key);
+        parent->keys.insert(parent->keys.begin() + index, std::move(mid_key));
         ch(parent).insert(ch(parent).begin() + index + 1, new_node);
     }
 
@@ -1032,8 +1032,19 @@ public:
     // O(log n) - Insert a key into the tree
     void insert(const T& key) {
         if (root == nullptr) {
-            root = make_node(true);
-            root->keys.push_back(key);
+            // Defer publishing `root` until the (possibly-throwing) copy of `key`
+            // succeeds: if push_back throws, the tree must stay empty (root stays
+            // null) rather than be left with a keyless root that makes empty()
+            // disagree with size(). Free the node on the throwing path so it leaks
+            // nothing.
+            Node* n = make_node(true);
+            try {
+                n->keys.push_back(key);
+            } catch (...) {
+                free_one(n);
+                throw;
+            }
+            root = n;
             size_++;
             return;
         }
