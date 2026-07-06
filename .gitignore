@@ -8,3 +8,6 @@ btree_test
 
 # Debug files
 *.dSYM/
+
+# Claude Code project guidance (local only)
+CLAUDE.md
