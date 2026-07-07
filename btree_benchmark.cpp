@@ -164,6 +164,26 @@ BenchmarkResult benchmark_find(BTree<int, Order>& tree, const std::vector<int>& 
     return {"BTree<" + std::to_string(Order) + "> find", best_ms, queries.size()};
 }
 
+// Benchmark count() (range query: two logarithmic descents to the endpoints).
+template<int Order>
+BenchmarkResult benchmark_count(BTree<int, Order>& tree, const std::vector<int>& queries) {
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile size_t total = 0;  // Prevent optimization
+        for (int val : queries) {
+            total += tree.count(val);
+        }
+        (void)total;
+        double elapsed = timer.elapsed_ms();
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
+            best_ms = elapsed;
+        }
+    }
+    return {"BTree<" + std::to_string(Order) + "> count", best_ms, queries.size()};
+}
+
 // Benchmark remove operation
 template<int Order>
 BenchmarkResult benchmark_remove(const std::vector<int>& data) {
@@ -259,6 +279,24 @@ BenchmarkResult benchmark_set_find(std::set<int>& s, const std::vector<int>& que
     return {"std::set find", best_ms, queries.size()};
 }
 
+BenchmarkResult benchmark_set_count(std::set<int>& s, const std::vector<int>& queries) {
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        volatile size_t total = 0;
+        for (int val : queries) {
+            total += s.count(val);
+        }
+        (void)total;
+        double elapsed = timer.elapsed_ms();
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
+            best_ms = elapsed;
+        }
+    }
+    return {"std::set count", best_ms, queries.size()};
+}
+
 BenchmarkResult benchmark_set_remove(const std::vector<int>& data) {
     std::set<int> s;
     for (int val : data) {
@@ -332,6 +370,9 @@ void run_benchmarks_for_order(size_t /*n*/, const std::vector<int>& random_data,
     // Find benchmark (iterator-based lookup)
     print_result(benchmark_find<Order>(tree, random_data));
 
+    // Count benchmark (range query)
+    print_result(benchmark_count<Order>(tree, random_data));
+
     // Iterate benchmark
     print_result(benchmark_iterate<Order>(tree));
 
@@ -351,6 +392,7 @@ void run_set_benchmarks(size_t /*n*/, const std::vector<int>& random_data) {
 
     print_result(benchmark_set_search(s, random_data));
     print_result(benchmark_set_find(s, random_data));
+    print_result(benchmark_set_count(s, random_data));
     print_result(benchmark_set_iterate(s));
     print_result(benchmark_set_remove(random_data));
 }

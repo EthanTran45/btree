@@ -3112,6 +3112,102 @@ TEST(test_bulk_load_find_leftmost_duplicate) {
     }
 }
 
+// === Range queries: lower_bound / upper_bound / equal_range / count ===
+//
+// Differential check against std::multiset, which defines the exact semantics
+// we must match: lower_bound = first element >= key, upper_bound = first > key,
+// equal_range = [lower, upper), count = number of occurrences. Covers present
+// and absent keys, boundary keys (below min / above max), and heavy duplicates.
+template <int Order>
+static void range_query_check(const std::vector<int>& input) {
+    std::multiset<int> ref(input.begin(), input.end());
+    BTree<int, Order> tree(input.begin(), input.end());
+
+    // Query a superset of keys: every value present, plus gaps and out-of-range.
+    std::vector<int> queries;
+    for (int v : input) { queries.push_back(v); queries.push_back(v - 1); queries.push_back(v + 1); }
+    queries.push_back(std::numeric_limits<int>::min());
+    queries.push_back(std::numeric_limits<int>::max());
+
+    for (int q : queries) {
+        auto rlo = ref.lower_bound(q);
+        auto tlo = tree.lower_bound(q);
+        ASSERT_EQ(tlo == tree.end(), rlo == ref.end());
+        if (rlo != ref.end()) ASSERT_EQ(*tlo, *rlo);
+
+        auto rhi = ref.upper_bound(q);
+        auto thi = tree.upper_bound(q);
+        ASSERT_EQ(thi == tree.end(), rhi == ref.end());
+        if (rhi != ref.end()) ASSERT_EQ(*thi, *rhi);
+
+        // count matches, and equal_range spans exactly that many, all equal to q.
+        size_t expected = ref.count(q);
+        ASSERT_EQ(tree.count(q), expected);
+
+        auto er = tree.equal_range(q);
+        size_t span = 0;
+        for (auto it = er.first; it != er.second; ++it) {
+            ASSERT_EQ(*it, q);
+            ++span;
+        }
+        ASSERT_EQ(span, expected);
+        ASSERT_TRUE(er.first == tlo);   // equal_range.first == lower_bound
+        ASSERT_TRUE(er.second == thi);  // equal_range.second == upper_bound
+    }
+}
+
+TEST(test_range_queries_differential) {
+    std::mt19937 rng(31337);
+    for (size_t n : {size_t(0), size_t(1), size_t(2), size_t(5), size_t(50),
+                     size_t(500), size_t(3000)}) {
+        std::vector<int> data(n);
+        for (size_t i = 0; i < n; ++i) data[i] = static_cast<int>(rng() % 200);  // dup-heavy
+        range_query_check<3>(data);
+        range_query_check<5>(data);
+        range_query_check<64>(data);
+        range_query_check<100>(data);
+    }
+}
+
+// A key type that tallies every comparison it participates in, to prove that
+// count()/equal_range descend the tree (O(log n + k) comparisons) instead of
+// scanning every element (O(n)).
+struct CmpCounter {
+    int v;
+    static long cmps;
+    CmpCounter(int x = 0) : v(x) {}
+    bool operator<(const CmpCounter& o) const { ++cmps; return v < o.v; }
+    bool operator==(const CmpCounter& o) const { ++cmps; return v == o.v; }
+};
+long CmpCounter::cmps = 0;
+
+// count() must use a logarithmic descent, not a linear scan: for a large tree
+// it performs dramatically fewer key comparisons than std::count over the whole
+// range. Pre-change there is no count(), so this fails to compile.
+TEST(test_count_is_sublinear) {
+    const int N = 20000;
+    std::vector<CmpCounter> data;
+    data.reserve(N);
+    std::mt19937 rng(7);
+    for (int i = 0; i < N; ++i) data.emplace_back(static_cast<int>(rng() % 1000));
+    BTree<CmpCounter, 64> tree(data.begin(), data.end());
+
+    const CmpCounter probe(500);
+
+    CmpCounter::cmps = 0;
+    size_t c_tree = tree.count(probe);
+    long cmps_tree = CmpCounter::cmps;
+
+    CmpCounter::cmps = 0;
+    long c_scan = std::count(tree.begin(), tree.end(), probe);
+    long cmps_scan = CmpCounter::cmps;
+
+    ASSERT_EQ(c_tree, static_cast<size_t>(c_scan));  // same answer
+    ASSERT_TRUE(cmps_scan >= N);                     // full scan touches every element
+    // The descent must be at least ~20x cheaper in comparisons than the scan.
+    ASSERT_TRUE(cmps_tree * 20 < cmps_scan);
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -3282,6 +3378,10 @@ int main() {
     RUN_TEST(test_bulk_load_range_constructor);
     RUN_TEST(test_bulk_load_initializer_list);
     RUN_TEST(test_bulk_load_find_leftmost_duplicate);
+
+    // Range queries: lower_bound / upper_bound / equal_range / count.
+    RUN_TEST(test_range_queries_differential);
+    RUN_TEST(test_count_is_sublinear);
 
     std::cout << std::endl;
     std::cout << "=== Results ===" << std::endl;

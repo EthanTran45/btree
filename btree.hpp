@@ -1221,6 +1221,64 @@ private:
         return iterator();  // key not present
     }
 
+    // Build an iterator to the first in-order element that is >= key (upper ==
+    // false, "lower_bound") or > key (upper == true, "upper_bound"), or end() if
+    // no such element exists. Mirrors find_impl's descent: push the
+    // lower/upper-index child at each level down to a leaf, then walk back up to
+    // the deepest frame whose stored index is still within its node's keys --
+    // that key is the bound. Because the descent always takes the leftmost
+    // qualifying child, the bound is the leftmost such element, so it is correct
+    // in the presence of duplicates (matching std::multiset semantics).
+    iterator bound_impl(const T& key, bool upper) const {
+        iterator result;
+        if (root == nullptr) {
+            return iterator();
+        }
+
+        Node* node = root;
+        while (true) {
+            size_t i = upper
+                           ? upper_index(node->keys.begin(), node->keys.size(), key)
+                           : lower_index(node->keys.begin(), node->keys.size(), key);
+            result.stack_.push({node, i});
+            if (node->is_leaf) {
+                break;
+            }
+            node = ch(node)[i];
+        }
+
+        // Pop frames whose index ran past the node's keys (the bound is neither in
+        // nor at that node); the first frame with an in-range index holds it. The
+        // exhausted subtree we descended contained only elements strictly on the
+        // near side of the bound, so skipping it is correct.
+        while (!result.stack_.empty()) {
+            auto& frame = result.stack_.top();
+            Node* fn = frame.node;
+            size_t i = frame.index;
+
+            if (i < fn->keys.size()) {
+                result.current_ = &fn->keys[i];
+                frame.index = i + 1;  // next in-order step resumes after this key
+
+                // If internal, the successor is the left spine of the right
+                // subtree; push it so ++ descends there first. (fn/i are locals,
+                // so the pushes below can't be disturbed by a stack realloc.)
+                if (!fn->is_leaf && i + 1 < ch(fn).size()) {
+                    Node* right_child = ch(fn)[i + 1];
+                    while (right_child != nullptr) {
+                        result.stack_.push({right_child, 0});
+                        if (right_child->is_leaf) break;
+                        right_child = ch(right_child)[0];
+                    }
+                }
+                return result;
+            }
+            result.stack_.pop();
+        }
+
+        return iterator();  // no element on the far side of the bound
+    }
+
 public:
     BTree() : root(nullptr), size_(0), height_(0) {
         configure_pools();
@@ -1339,6 +1397,38 @@ public:
     // O(log n) lookup returning iterator to element, or end() if not found
     [[nodiscard]] iterator find(const T& key) const {
         return find_impl(key);
+    }
+
+    // O(log n) - Iterator to the first element not less than `key` (>= key), or
+    // end() if every element is less than `key`. Matches std::multiset semantics.
+    [[nodiscard]] iterator lower_bound(const T& key) const {
+        return bound_impl(key, /*upper=*/false);
+    }
+
+    // O(log n) - Iterator to the first element greater than `key` (> key), or
+    // end() if no element is greater. Matches std::multiset semantics.
+    [[nodiscard]] iterator upper_bound(const T& key) const {
+        return bound_impl(key, /*upper=*/true);
+    }
+
+    // O(log n) - The half-open range [lower_bound(key), upper_bound(key)) that
+    // spans exactly the occurrences of `key`. Iterating it yields count(key)
+    // elements, all equal to `key` (empty range if `key` is absent).
+    [[nodiscard]] std::pair<iterator, iterator> equal_range(const T& key) const {
+        return {bound_impl(key, /*upper=*/false), bound_impl(key, /*upper=*/true)};
+    }
+
+    // O(log n + k) - Number of occurrences of `key` (k = that count). Two
+    // logarithmic descents to the range endpoints plus a walk across them --
+    // far cheaper than an O(n) std::count over the whole tree.
+    [[nodiscard]] size_t count(const T& key) const {
+        iterator lo = bound_impl(key, /*upper=*/false);
+        iterator hi = bound_impl(key, /*upper=*/true);
+        size_t c = 0;
+        for (; lo != hi; ++lo) {
+            ++c;
+        }
+        return c;
     }
 
     // O(n) - Print all keys in sorted order to stdout
