@@ -8,10 +8,13 @@ This project provides a generic, templated B-tree implementation supporting:
 - Configurable order (default: 64; any order >= 3)
 - Any comparable key type (int, string, double, etc.)
 - Insert, search, remove, and find operations
+- Duplicate keys (multiset semantics; `find` returns the first/leftmost match)
 - In-order traversal with STL-compatible iterators
 - Cache-friendly node layout: each node is a single allocation with its keys
   stored inline (see [Implementation notes](#implementation-notes))
 - Move semantics
+- Strong exception-safety guarantee for `insert` and `remove` (see
+  [Exception safety](#exception-safety))
 
 ## Building
 
@@ -86,7 +89,7 @@ Compile and run the test suite:
 g++ -std=c++17 -Wall -Wextra -o btree_test btree_test.cpp && ./btree_test
 ```
 
-The test suite includes 111 tests organized into the following categories:
+The test suite includes 119 tests organized into the following categories:
 
 ### Basic Operations (19 tests)
 - Empty tree behavior and state transitions
@@ -98,7 +101,7 @@ The test suite includes 111 tests organized into the following categories:
 - Boundary values (INT_MIN, INT_MAX)
 - Traverse output verification
 
-### Remove Operations (10 tests)
+### Remove Operations (13 tests)
 - Basic removal and size updates
 - Removing non-existent keys (returns false)
 - Removing from empty tree
@@ -106,6 +109,11 @@ The test suite includes 111 tests organized into the following categories:
 - Rebalancing with borrow from siblings
 - Cascade merging when nodes underflow
 - Removing in reverse order
+- Strong exception guarantee: a throwing key-copy during `remove()` leaves the
+  tree completely unchanged
+- Strong exception guarantee when the throw lands mid-rebalance (borrow/merge)
+- Strong exception guarantee for `insert()` when a node allocation fails during
+  a split cascade
 
 ### Move Semantics (2 tests)
 - Move constructor transfers ownership
@@ -141,17 +149,19 @@ The test suite includes 111 tests organized into the following categories:
 - STL algorithm compatibility (std::find, std::count)
 - find() method returning iterator
 
-### Additional Tests (51 tests)
-- Move semantics edge cases (self-move, empty tree move)
+### Additional Tests (56 tests)
+- Move semantics edge cases (self-move, empty tree move, reuse after move)
 - Height verification and growth patterns
 - Min/max through modifications
 - Clear edge cases
-- Find with duplicates and after modifications
+- Find with duplicates and after modifications; `find` returns the leftmost match
 - Higher-order remove stress tests (Order 4, 6, 7)
 - Large scale tests (10K, 50K operations)
 - String stress tests and custom comparable types
 - Critical B-tree edge conditions (root collapse, case 2c recursive, merge/split cycles)
 - Iterator validity and cross-tree comparison
+- Duplicate-heavy coverage: randomized differential stress against `std::multiset`,
+  leftmost-`find` half-open range iteration, and all-identical-key insert/remove churn
 
 ## Running Benchmarks
 
@@ -233,7 +243,7 @@ Template parameters:
 | `bool remove(const T& key)` | O(log n) | Remove a key, returns true if found |
 | `bool search(const T& key) const` | O(log n) | Returns true if key exists |
 | `bool contains(const T& key) const` | O(log n) | Alias for search (STL-style) |
-| `iterator find(const T& key) const` | O(log n) | Returns iterator to key, or end() if not found |
+| `iterator find(const T& key) const` | O(log n) | Returns iterator to the first (leftmost) match, or end() if not found |
 
 #### Traversal
 | Method | Complexity | Description |
@@ -248,7 +258,7 @@ Template parameters:
 |--------|------------|-------------|
 | `bool empty() const` | O(1) | Returns true if tree is empty |
 | `size_t size() const` | O(1) | Returns number of keys |
-| `size_t height() const` | O(log n) | Returns height of tree (0 if empty) |
+| `size_t height() const` | O(1) | Returns height of tree (0 if empty) |
 | `void clear()` | O(n) | Remove all keys |
 | `const T& min() const` | O(log n) | Returns smallest key (throws if empty) |
 | `const T& max() const` | O(log n) | Returns largest key (throws if empty) |
@@ -279,6 +289,33 @@ int count = std::count(tree.begin(), tree.end(), 42);
 ```
 
 Note: Copy operations are disabled. Use `std::move()` to transfer ownership.
+
+## Exception safety
+
+`insert()` and `remove()` provide the **strong exception guarantee**: if the
+operation throws — whether from a throwing key copy/comparison or from an
+allocation failure while growing the tree — the tree is left exactly as it was
+before the call. No element is lost or duplicated, `size()` and `empty()` stay
+consistent, and nothing is leaked. Both operations copy the incoming (or
+predecessor) value *before* mutating any node, then perform all buffer shuffling
+by move, so once the mutation begins it cannot fail partway through.
+
+This relies on the element type being cheap and infallible to relocate, which is
+enforced at compile time:
+
+```cpp
+static_assert(std::is_nothrow_move_constructible_v<T> &&
+              std::is_nothrow_move_assignable_v<T>);
+```
+
+`T` must be nothrow-move-constructible and nothrow-move-assignable (the standard
+library types you would reach for — `int`, `double`, `std::string`, etc. — all
+qualify). `T`'s *copy* constructor and comparison operators may throw; those
+throwing paths are exactly what the guarantee protects against.
+
+`search()` / `contains()` are `noexcept` when `T`'s comparison is `noexcept`
+(always so for arithmetic keys and `std::string`). `min()` and `max()` throw
+`std::runtime_error` when called on an empty tree.
 
 ## Iterator Invalidation
 
