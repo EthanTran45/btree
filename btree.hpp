@@ -1279,6 +1279,54 @@ private:
         return iterator();  // no element on the far side of the bound
     }
 
+    // Count occurrences of `key` in the subtree rooted at `node` in a single
+    // descent. At a node that holds no copy of `key` we recurse into the one
+    // child that could contain it (a plain root-to-leaf path, like search),
+    // paying just one in-node scan; only where the equal run actually begins do
+    // we pay the second (upper_index) scan and fan out. Total work is
+    // O(log n + k), and for an absent or leaf-resident key it is a single
+    // descent -- half the node-load passes of two separate lower_bound /
+    // upper_bound descents.
+    size_t count_node(Node* node, const T& key) const {
+        size_t lo = lower_index(node->keys.begin(), node->keys.size(), key);
+        if (lo == node->keys.size() || !(node->keys[lo] == key)) {
+            // No key equal to `key` here; if present at all it is entirely within
+            // child[lo] (the gap this key falls into).
+            if (node->is_leaf) {
+                return 0;
+            }
+            return count_node(ch(node)[lo], key);
+        }
+        // keys[lo] == key: the equal run [lo, hi) lives in this node. Copies may
+        // also spill into child[lo] (its right edge), the wholly-equal children
+        // strictly between the equal separators, and child[hi] (its left edge).
+        size_t hi = upper_index(node->keys.begin(), node->keys.size(), key);
+        size_t c = hi - lo;
+        if (node->is_leaf) {
+            return c;
+        }
+        c += count_node(ch(node)[lo], key);
+        for (size_t i = lo + 1; i < hi; ++i) {
+            c += subtree_size(ch(node)[i]);  // wholly between equal separators
+        }
+        c += count_node(ch(node)[hi], key);
+        return c;
+    }
+
+    // Total number of keys in the subtree rooted at `node` (O(subtree)). Used by
+    // count_node only for children that lie entirely within an equal run -- every
+    // one of their keys equals the sought key -- so this work is charged to the
+    // k matches, keeping count() at O(log n + k).
+    static size_t subtree_size(Node* node) {
+        size_t s = node->keys.size();
+        if (!node->is_leaf) {
+            for (Node* c : ch(node)) {
+                s += subtree_size(c);
+            }
+        }
+        return s;
+    }
+
 public:
     BTree() : root(nullptr), size_(0), height_(0) {
         configure_pools();
@@ -1418,17 +1466,13 @@ public:
         return {bound_impl(key, /*upper=*/false), bound_impl(key, /*upper=*/true)};
     }
 
-    // O(log n + k) - Number of occurrences of `key` (k = that count). Two
-    // logarithmic descents to the range endpoints plus a walk across them --
-    // far cheaper than an O(n) std::count over the whole tree.
+    // O(log n + k) - Number of occurrences of `key` (k = that count). A single
+    // tree descent (see count_node): where `key` is absent it follows one child
+    // per level like search, only fanning out across the equal run once it is
+    // found -- roughly half the node-load passes of two lower_bound/upper_bound
+    // descents, and far cheaper than an O(n) std::count over the whole tree.
     [[nodiscard]] size_t count(const T& key) const {
-        iterator lo = bound_impl(key, /*upper=*/false);
-        iterator hi = bound_impl(key, /*upper=*/true);
-        size_t c = 0;
-        for (; lo != hi; ++lo) {
-            ++c;
-        }
-        return c;
+        return root == nullptr ? 0 : count_node(root, key);
     }
 
     // O(n) - Print all keys in sorted order to stdout

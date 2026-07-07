@@ -3208,6 +3208,34 @@ TEST(test_count_is_sublinear) {
     ASSERT_TRUE(cmps_tree * 20 < cmps_scan);
 }
 
+// count() must reach its answer in a SINGLE root-to-leaf descent, not two: its
+// per-query comparison work should be within ~1.4x of a single find(). A
+// two-descent implementation (one pass for lower_bound, one for upper_bound)
+// runs at ~1.7-1.9x find(), so this fails before the single-descent change and
+// passes after. Aggregated over many random queries for a stable ratio.
+TEST(test_count_single_descent) {
+    const int N = 50000;
+    std::vector<CmpCounter> data;
+    data.reserve(N);
+    std::mt19937 rng(7);
+    for (int i = 0; i < N; ++i) data.emplace_back(static_cast<int>(rng() % 100000));
+    BTree<CmpCounter, 16> tree(data.begin(), data.end());
+
+    long find_total = 0, count_total = 0;
+    std::mt19937 q(999);
+    for (int t = 0; t < 200; ++t) {
+        CmpCounter probe(static_cast<int>(q() % 100000));
+        CmpCounter::cmps = 0;
+        (void)tree.find(probe);
+        find_total += CmpCounter::cmps;
+        CmpCounter::cmps = 0;
+        (void)tree.count(probe);
+        count_total += CmpCounter::cmps;
+    }
+    ASSERT_TRUE(find_total > 0 && count_total > 0);
+    ASSERT_TRUE(count_total * 10 <= find_total * 14);  // count comparisons <= 1.4x find
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -3382,6 +3410,7 @@ int main() {
     // Range queries: lower_bound / upper_bound / equal_range / count.
     RUN_TEST(test_range_queries_differential);
     RUN_TEST(test_count_is_sublinear);
+    RUN_TEST(test_count_single_descent);
 
     std::cout << std::endl;
     std::cout << "=== Results ===" << std::endl;

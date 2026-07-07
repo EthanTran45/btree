@@ -109,7 +109,7 @@ Compile and run the test suite:
 g++ -std=c++17 -Wall -Wextra -o btree_test btree_test.cpp && ./btree_test
 ```
 
-The test suite includes 126 tests organized into the following categories:
+The test suite includes 127 tests organized into the following categories:
 
 ### Basic Operations (19 tests)
 - Empty tree behavior and state transitions
@@ -169,7 +169,7 @@ The test suite includes 126 tests organized into the following categories:
 - STL algorithm compatibility (std::find, std::count)
 - find() method returning iterator
 
-### Additional Tests (63 tests)
+### Additional Tests (64 tests)
 - Move semantics edge cases (self-move, empty tree move, reuse after move)
 - Height verification and growth patterns
 - Min/max through modifications
@@ -191,8 +191,10 @@ The test suite includes 126 tests organized into the following categories:
   and leftmost-`find` correctness over a bulk-loaded tree with duplicates
 - Range queries (`lower_bound`/`upper_bound`/`equal_range`/`count`): differential
   vs `std::multiset` across orders and duplicate-heavy inputs (present, absent,
-  and out-of-range keys), plus a comparison-counting key type proving `count()`
-  is sublinear (a logarithmic descent, not an O(n) scan)
+  and out-of-range keys), plus comparison-counting key types proving `count()`
+  is sublinear (not an O(n) scan) and reaches its answer in a single descent
+  (its comparison work stays within ~1.4× of a single `find`, versus ~1.9× for a
+  two-descent implementation)
 
 ## Running Benchmarks
 
@@ -222,14 +224,14 @@ Measured at **1,000,000 elements**, compiled with `g++ -O2` (GCC 16, Windows). V
 | bulk-load (sorted)   |   9.8   |    4.8   |    4.3   |        4.3         |    3.7    |     —      |
 | search               |   394   |    108   |     77   |         79         |     88    |    543     |
 | find (iterator)      |   501   |    126   |     79   |         81         |     95    |    545     |
-| count (range query)  |   675   |    211   |    151   |        157         |    181    |    539     |
+| count (range query)  |   442   |    116   |     91   |         95         |    116    |    539     |
 | iterate (full scan)  |    23   |    4.3   |    2.0   |        1.9         |    1.8    |    102     |
 | remove (random)      |   472   |    144   |     93   |         93         |    103    |    653     |
 
 Takeaways:
 - **Default order 64 vs `std::set` at 1M:** ~5× faster to build, ~7× faster to search, ~7× faster to find/remove, and **~55× faster** to iterate in sorted order — inline, contiguous keys make both the descent and the full scan far more cache-friendly than pointer-chasing a red-black tree.
 - **Bulk-load is the fastest way to build a tree.** The `BTree(first, last)` constructor sorts once (cache-friendly) then assembles the tree bottom-up with sequential writes, skipping a million separate root-to-leaf descents. From **random** data it is 1.3–5.4× faster than element-wise `insert` (the win is largest at low orders, where per-insert descent cost dominates). From **already-sorted** data an `is_sorted` fast-path skips the sort, so a 1M-element tree is built in **under 5 ms** at the larger orders — ~20× faster than random `insert` and faster even than the O(1)-append sequential-insert path.
-- **Range queries are logarithmic.** `count(key)` performs two O(log n) descents (to `lower_bound` and `upper_bound`) plus a walk across the matches, so it stays cheap even on a million elements — ~3.4× faster than `std::set::count` at order 64 — instead of the O(n) full scan you would otherwise write. It costs about 2× a single `search` because it locates both ends of the range.
+- **Range queries are logarithmic.** `count(key)` descends the tree once (following one child per level like `search`, only fanning out across the equal run once it is found), so it stays cheap even on a million elements — **~5.7× faster than `std::set::count`** at order 64, and only ~1.2× the cost of a single `search` — instead of the O(n) full scan you would otherwise write.
 - **Higher orders are faster, up to a sweet spot around 50–100.** Larger nodes mean a shallower tree and fewer cache misses; a branchless in-node key scan keeps per-node work cheap even at order 100. Order 3 is the slowest (deepest tree, most per-node overhead) but is correct and still comfortably beats `std::set`.
 - **Sequential insertion is nearly free** thanks to an O(1) append fast-path; if you already hold the data, the bulk-load constructor is faster still.
 - **Versus the previous `std::vector`-per-node implementation** (same machine, same benchmark): roughly **3× faster** across the board at order 3 and **1.3–1.7×** at order 100, with the largest gains from the single-allocation inline node layout and the branchless in-node search.
