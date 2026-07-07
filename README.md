@@ -12,7 +12,8 @@ This project provides a generic, templated B-tree implementation supporting:
 - In-order traversal with STL-compatible iterators
 - Cache-friendly node layout: each node is a single allocation with its keys
   stored inline (see [Implementation notes](#implementation-notes))
-- Move semantics
+- Move semantics, including a move-aware `insert(T&&)` that relocates the key
+  into its leaf instead of copying it
 - Strong exception-safety guarantee for `insert` and `remove` (see
   [Exception safety](#exception-safety))
 
@@ -77,6 +78,10 @@ BTree<std::string, 5> string_tree;
 string_tree.insert("apple");
 string_tree.insert("banana");
 
+// Move a key straight into the tree (no copy of the string payload)
+std::string big = build_large_key();
+string_tree.insert(std::move(big));  // big is left in a valid moved-from state
+
 // Move semantics (copy is disabled)
 BTree<int> tree2 = std::move(tree);  // tree is now empty
 ```
@@ -89,7 +94,7 @@ Compile and run the test suite:
 g++ -std=c++17 -Wall -Wextra -o btree_test btree_test.cpp && ./btree_test
 ```
 
-The test suite includes 119 tests organized into the following categories:
+The test suite includes 121 tests organized into the following categories:
 
 ### Basic Operations (19 tests)
 - Empty tree behavior and state transitions
@@ -149,7 +154,7 @@ The test suite includes 119 tests organized into the following categories:
 - STL algorithm compatibility (std::find, std::count)
 - find() method returning iterator
 
-### Additional Tests (56 tests)
+### Additional Tests (58 tests)
 - Move semantics edge cases (self-move, empty tree move, reuse after move)
 - Height verification and growth patterns
 - Min/max through modifications
@@ -162,6 +167,9 @@ The test suite includes 119 tests organized into the following categories:
 - Iterator validity and cross-tree comparison
 - Duplicate-heavy coverage: randomized differential stress against `std::multiset`,
   leftmost-`find` half-open range iteration, and all-identical-key insert/remove churn
+- Move-aware `insert(T&&)`: an rvalue key is relocated into its leaf with zero
+  copies (proven with a copy/move-counting key type), while the lvalue overload
+  still copies and leaves the caller's object intact
 
 ## Running Benchmarks
 
@@ -239,7 +247,8 @@ Template parameters:
 #### Core Methods
 | Method | Complexity | Description |
 |--------|------------|-------------|
-| `void insert(const T& key)` | O(log n) | Insert a key into the tree |
+| `void insert(const T& key)` | O(log n) | Insert a key into the tree (copies the key) |
+| `void insert(T&& key)` | O(log n) | Insert a key, moving from `key` (one fewer key copy for movable types) |
 | `bool remove(const T& key)` | O(log n) | Remove a key, returns true if found |
 | `bool search(const T& key) const` | O(log n) | Returns true if key exists |
 | `bool contains(const T& key) const` | O(log n) | Alias for search (STL-style) |
@@ -298,7 +307,11 @@ allocation failure while growing the tree — the tree is left exactly as it was
 before the call. No element is lost or duplicated, `size()` and `empty()` stay
 consistent, and nothing is leaked. Both operations copy the incoming (or
 predecessor) value *before* mutating any node, then perform all buffer shuffling
-by move, so once the mutation begins it cannot fail partway through.
+by move, so once the mutation begins it cannot fail partway through. The
+move-aware `insert(T&&)` overload instead *moves* the key into its leaf, but a
+move is `noexcept` for any supported `T`, so its commit point cannot throw
+either; only the (unchanged) key comparisons during the descent can, and those
+run before any node is touched.
 
 This relies on the element type being cheap and infallible to relocate, which is
 enforced at compile time:

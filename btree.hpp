@@ -732,21 +732,101 @@ private:
 
     // Reactive insert: descend to the target leaf and insert there, then split
     // the child on the way back up if it overflowed past max_keys.
-    void insert_rec(Node* node, const T& key) {
+    //
+    // Templated on the key reference so a single descent serves both public
+    // overloads: an lvalue key (K = const T&) is copied into its leaf slot, an
+    // rvalue key (K = T) is moved. `key` is only ever *compared* (an lvalue use)
+    // at each internal level and then forwarded unchanged to the next level, so
+    // it is not relocated until the single leaf insert at the bottom of the
+    // descent -- forwarding down the spine never moves it prematurely.
+    template <typename K>
+    void insert_rec(Node* node, K&& key) {
         if (node->is_leaf) {
             // Search for insertion position (duplicates allowed).
             size_t i = lower_index(node->keys.begin(), node->keys.size(), key);
-            node->keys.insert(node->keys.begin() + i, key);
+            node->keys.insert(node->keys.begin() + i, std::forward<K>(key));
             return;
         }
         // upper_index places a new duplicate after existing equal keys.
         size_t i = upper_index(node->keys.begin(), node->keys.size(), key);
 
-        insert_rec(ch(node)[i], key);
+        insert_rec(ch(node)[i], std::forward<K>(key));
 
         if (ch(node)[i]->keys.size() > static_cast<size_t>(max_keys)) {
             split_child(node, i);
         }
+    }
+
+    // Shared body for the two public insert overloads (see insert()). Templated
+    // on the key reference: an lvalue key is copied into its leaf, an rvalue key
+    // is moved. Both share the same descent, split-cascade reservation, and
+    // root-growth logic; only the final leaf placement differs (copy vs move).
+    //
+    // Strong exception guarantee (unchanged from the copy-only version): the only
+    // steps that can throw -- the pre-commit pool reservations and, on the lvalue
+    // path, the key copy that InlineVec::insert stages into a temporary before
+    // touching the buffer -- all run before any node is mutated. A throwing
+    // comparison during the descent likewise happens before the leaf is touched.
+    // Once the key is placed at the leaf, every remaining step (buffer shuffles,
+    // split relocations, root growth) is a noexcept move, so the mutation cannot
+    // fail partway through. On the rvalue path the leaf placement is itself a
+    // noexcept move, so that path cannot throw at all once the descent completes.
+    template <typename K>
+    void insert_impl(K&& key) {
+        if (root == nullptr) {
+            // Defer publishing `root` until the (possibly-throwing) placement of
+            // `key` succeeds: if it throws, the tree must stay empty (root stays
+            // null) rather than be left with a keyless root that makes empty()
+            // disagree with size(). Free the node on the throwing path so it leaks
+            // nothing.
+            Node* n = make_node(true);
+            try {
+                n->keys.push_back(std::forward<K>(key));
+            } catch (...) {
+                free_one(n);
+                throw;
+            }
+            root = n;
+            size_++;
+            height_ = 1;
+            return;
+        }
+
+        // Pre-reserve every node the split cascade could allocate, BEFORE the key
+        // is committed to a leaf. A single insert splits at most the one target
+        // leaf (one new leaf) and, in the worst case, one node at every level up
+        // to and including a freshly grown root (at most height()+1 new internal
+        // nodes). Carving those blocks onto the pools' free-lists up front means
+        // every make_node() on the recursion unwind reuses a block and never calls
+        // ::operator new -- so once insert_rec() commits the key, no remaining step
+        // can throw. If a reservation itself throws bad_alloc, the tree has not
+        // been mutated yet, so insert()'s strong exception guarantee holds. Without
+        // this, a bad_alloc from a split's make_node would leave a node holding
+        // max_keys+1 keys -- an over-capacity, corrupt node -- with size_ uncounted.
+        leaf_pool_.reserve(1);
+        // Reserve internal blocks only when this insert could actually create one.
+        // A single-leaf root grows an internal root only if the insert overflows
+        // it; reserving otherwise would eagerly allocate an internal slab a small
+        // tree never needs. An internal tree can cascade a split up every level
+        // and grow a new root: at most height_ new internal nodes (+1 margin).
+        if (!root->is_leaf) {
+            internal_pool_.reserve(height_ + 1);
+        } else if (root->keys.size() >= static_cast<size_t>(max_keys)) {
+            internal_pool_.reserve(1);
+        }
+
+        insert_rec(root, std::forward<K>(key));
+
+        // If the root overflowed, grow a new root above it and split.
+        if (root->keys.size() > static_cast<size_t>(max_keys)) {
+            Node* new_root = make_node(false);
+            ch(new_root).push_back(root);
+            split_child(new_root, 0);
+            root = new_root;
+            ++height_;
+        }
+
+        size_++;
     }
 
     Node* search_node(Node* node, const T& key) const {
@@ -1057,63 +1137,16 @@ public:
         return *this;
     }
 
-    // O(log n) - Insert a key into the tree
-    void insert(const T& key) {
-        if (root == nullptr) {
-            // Defer publishing `root` until the (possibly-throwing) copy of `key`
-            // succeeds: if push_back throws, the tree must stay empty (root stays
-            // null) rather than be left with a keyless root that makes empty()
-            // disagree with size(). Free the node on the throwing path so it leaks
-            // nothing.
-            Node* n = make_node(true);
-            try {
-                n->keys.push_back(key);
-            } catch (...) {
-                free_one(n);
-                throw;
-            }
-            root = n;
-            size_++;
-            height_ = 1;
-            return;
-        }
+    // O(log n) - Insert a key into the tree by copying it.
+    void insert(const T& key) { insert_impl(key); }
 
-        // Pre-reserve every node the split cascade could allocate, BEFORE the key
-        // is committed to a leaf. A single insert splits at most the one target
-        // leaf (one new leaf) and, in the worst case, one node at every level up
-        // to and including a freshly grown root (at most height()+1 new internal
-        // nodes). Carving those blocks onto the pools' free-lists up front means
-        // every make_node() on the recursion unwind reuses a block and never calls
-        // ::operator new -- so once insert_rec() commits the key, no remaining step
-        // can throw. If a reservation itself throws bad_alloc, the tree has not
-        // been mutated yet, so insert()'s strong exception guarantee holds. Without
-        // this, a bad_alloc from a split's make_node would leave a node holding
-        // max_keys+1 keys -- an over-capacity, corrupt node -- with size_ uncounted.
-        leaf_pool_.reserve(1);
-        // Reserve internal blocks only when this insert could actually create one.
-        // A single-leaf root grows an internal root only if the insert overflows
-        // it; reserving otherwise would eagerly allocate an internal slab a small
-        // tree never needs. An internal tree can cascade a split up every level
-        // and grow a new root: at most height_ new internal nodes (+1 margin).
-        if (!root->is_leaf) {
-            internal_pool_.reserve(height_ + 1);
-        } else if (root->keys.size() >= static_cast<size_t>(max_keys)) {
-            internal_pool_.reserve(1);
-        }
-
-        insert_rec(root, key);
-
-        // If the root overflowed, grow a new root above it and split.
-        if (root->keys.size() > static_cast<size_t>(max_keys)) {
-            Node* new_root = make_node(false);
-            ch(new_root).push_back(root);
-            split_child(new_root, 0);
-            root = new_root;
-            ++height_;
-        }
-
-        size_++;
-    }
+    // O(log n) - Insert a key into the tree by moving from `key`. For movable key
+    // types (e.g. std::string) this relocates the key into its leaf slot instead
+    // of copying it -- one fewer key copy per insert. `key` is left in a valid
+    // moved-from state. Same strong exception guarantee as the copy overload
+    // (see insert_impl); because T is required to be nothrow-move-constructible,
+    // the actual relocation cannot throw.
+    void insert(T&& key) { insert_impl(std::move(key)); }
 
     // O(log n) - Remove a key from the tree. Returns true if key was found and removed.
     bool remove(const T& key) {

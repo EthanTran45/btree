@@ -2937,6 +2937,74 @@ TEST(test_insert_strong_exception_safety_alloc_fail) {
     ASSERT_FALSE(g_alloc_armed);
 }
 
+// === Move-aware insert(): rvalue keys are relocated, not copied ===
+//
+// A key type that separately tallies copy-constructions/assignments and
+// move-constructions/assignments, so a test can prove that inserting an rvalue
+// key MOVES it into the leaf rather than copying it. Move ops are noexcept (as
+// BTree requires); nothing here throws.
+struct MoveCounter {
+    int v;
+    static long copies;  // copy ctor + copy assign
+    static long moves;   // move ctor + move assign
+
+    MoveCounter(int val = 0) : v(val) {}
+    MoveCounter(const MoveCounter& o) : v(o.v) { ++copies; }
+    MoveCounter& operator=(const MoveCounter& o) { v = o.v; ++copies; return *this; }
+    MoveCounter(MoveCounter&& o) noexcept : v(o.v) { ++moves; }
+    MoveCounter& operator=(MoveCounter&& o) noexcept { v = o.v; ++moves; return *this; }
+    bool operator<(const MoveCounter& o) const noexcept { return v < o.v; }
+    bool operator==(const MoveCounter& o) const noexcept { return v == o.v; }
+};
+long MoveCounter::copies = 0;
+long MoveCounter::moves = 0;
+
+// Inserting rvalue keys must never copy the key: each key is moved from the
+// caller's temporary, down the descent, and into its leaf slot. Pre-change the
+// rvalue bound to insert(const T&) and every key was copy-constructed into the
+// leaf (copies == number of inserts); the move overload makes copies == 0.
+TEST(test_insert_rvalue_moves_not_copies) {
+    MoveCounter::copies = 0;
+    MoveCounter::moves = 0;
+
+    // Small order so the build cascades through many splits (all move-only),
+    // exercising the descent + leaf placement + split relocation paths.
+    BTree<MoveCounter, 6> tree;
+    const int N = 300;
+    for (int i = 0; i < N; ++i) {
+        tree.insert(MoveCounter(i * 7 % N));  // rvalue temporary
+    }
+
+    ASSERT_EQ(MoveCounter::copies, 0L);   // no key was ever copied
+    ASSERT_TRUE(MoveCounter::moves > 0);  // keys were relocated by move
+
+    // Correctness is unchanged: every key is present and the tree is well-formed.
+    ASSERT_EQ(tree.size(), static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        ASSERT_TRUE(tree.search(MoveCounter(i)));
+    }
+    std::vector<int> in_order;
+    for (const auto& mc : tree) in_order.push_back(mc.v);
+    ASSERT_EQ(in_order.size(), static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) ASSERT_EQ(in_order[i], i);
+}
+
+// The lvalue overload must still copy: it may not steal from the caller's
+// object. Guards against a careless refactor that forwards an lvalue as an
+// rvalue and leaves the source moved-from.
+TEST(test_insert_lvalue_preserves_source) {
+    BTree<std::string, 8> tree;
+    std::string s = "persistent-source-string";
+    tree.insert(s);  // lvalue: must copy, leaving s intact
+    ASSERT_EQ(s, std::string("persistent-source-string"));
+    ASSERT_TRUE(tree.search(std::string("persistent-source-string")));
+
+    // A moved-in rvalue string must also land correctly (value-level check).
+    std::string t = "moved-in-string";
+    tree.insert(std::move(t));
+    ASSERT_TRUE(tree.search(std::string("moved-in-string")));
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -3098,6 +3166,10 @@ int main() {
     RUN_TEST(test_find_halfopen_range_duplicates);
     RUN_TEST(test_reuse_populated_tree_after_move);
     RUN_TEST(test_all_identical_insert_remove);
+
+    // Move-aware insert(T&&): rvalue keys are relocated, not copied.
+    RUN_TEST(test_insert_rvalue_moves_not_copies);
+    RUN_TEST(test_insert_lvalue_preserves_source);
 
     std::cout << std::endl;
     std::cout << "=== Results ===" << std::endl;
