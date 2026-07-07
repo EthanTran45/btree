@@ -2441,6 +2441,191 @@ TEST(test_order_5_min_keys_boundary) {
     }
 }
 
+// === Duplicate-heavy differential fuzz against std::multiset ===
+//
+// The existing stress tests (test_random_operations_integrity, etc.) compare
+// against std::set and deliberately insert only UNIQUE values "to avoid
+// duplicate complexity". But duplicates are exactly where the tree's subtle
+// contracts live: upper_index places a new duplicate after existing equals,
+// split medians can be duplicated keys, remove_rec's predecessor swap can have
+// predecessor == separator, and find() must return the LEFTMOST equal element.
+// This mirrors a BTree against a std::multiset through a random insert/remove
+// workload with a small key range (so keys collide heavily) and asserts, at
+// every step, that size and membership agree and that the full in-order contents
+// match element-for-element (multiplicities included). A final randomized drain
+// removes every element, exercising borrow/merge on duplicate-laden nodes.
+template <int Order>
+static void multiset_differential(unsigned seed, int range, int ops) {
+    BTree<int, Order> tree;
+    std::multiset<int> ref;
+    std::mt19937 rng(seed);
+
+    for (int step = 0; step < ops; ++step) {
+        int key = static_cast<int>(rng() % static_cast<unsigned>(range));
+        bool do_insert = (rng() % 100u) < 55u;  // growth-biased: builds up deep
+                                                 // stacks of duplicates over time
+
+        if (do_insert) {
+            tree.insert(key);
+            ref.insert(key);
+        } else {
+            bool tree_removed = tree.remove(key);
+            auto rit = ref.find(key);
+            bool ref_removed = (rit != ref.end());
+            if (ref_removed) ref.erase(rit);  // erase exactly ONE instance, not all
+            ASSERT_EQ(tree_removed, ref_removed);
+        }
+
+        // Cheap invariants checked every step.
+        ASSERT_EQ(tree.size(), ref.size());
+        ASSERT_EQ(tree.search(key), ref.count(key) > 0);
+        ASSERT_EQ(tree.empty(), ref.empty());
+
+        // Expensive full-contents check amortized over every 16th step (+ last).
+        if ((step & 15) == 0 || step == ops - 1) {
+            std::vector<int> want(ref.begin(), ref.end());  // multiset: sorted
+            ASSERT_TRUE(tree.to_vector() == want);          // to_vector path
+            std::vector<int> via_iter;                      // range-for path
+            for (int v : tree) via_iter.push_back(v);
+            ASSERT_TRUE(via_iter == want);
+            if (!ref.empty()) {
+                ASSERT_EQ(tree.min(), *ref.begin());
+                ASSERT_EQ(tree.max(), *ref.rbegin());
+            }
+        }
+    }
+
+    // Drain every element in a shuffled order, staying in lockstep with the
+    // reference. Each remove() must succeed (the key came from ref) and drop
+    // size by exactly one; this walks the tree back down through every
+    // borrow/merge shape with duplicates still present.
+    std::vector<int> remaining(ref.begin(), ref.end());
+    std::shuffle(remaining.begin(), remaining.end(), rng);
+    for (int k : remaining) {
+        ASSERT_TRUE(tree.remove(k));
+        auto rit = ref.find(k);
+        ASSERT_TRUE(rit != ref.end());
+        ref.erase(rit);
+        ASSERT_EQ(tree.size(), ref.size());
+    }
+    ASSERT_TRUE(tree.empty());
+    ASSERT_EQ(tree.size(), 0u);
+    ASSERT_EQ(tree.height(), 0u);
+}
+
+TEST(test_multiset_differential_stress) {
+    multiset_differential<3>(1u, 32, 2500);    // order 3: min fan-out, tall trees
+    multiset_differential<4>(2u, 40, 2500);
+    multiset_differential<7>(3u, 64, 3000);
+    multiset_differential<64>(4u, 200, 4000);  // default order, wider key range
+}
+
+// find() must return the FIRST (leftmost, in-order) equal element even when a
+// key's duplicates straddle an internal separator and its left subtree. This
+// pins that contract precisely: for every probed key, [find(k), end()) must
+// equal the multiset suffix [lower_bound(k), end()) -- i.e. iterating from
+// find(k) reproduces the entire sorted tail beginning at the first occurrence.
+// A naive descent that stopped at the first internal match would yield a middle
+// occurrence and silently drop the earlier duplicates, breaking this equality.
+TEST(test_find_halfopen_range_duplicates) {
+    BTree<int, 3> tree;       // small order => many internal levels hold separators
+    std::multiset<int> ref;
+    std::mt19937 rng(20260707u);
+    const int K = 60;
+    for (int v = 0; v <= K; ++v) {
+        int copies = static_cast<int>(rng() % 5u);  // 0..4 copies (some keys absent)
+        for (int c = 0; c < copies; ++c) {
+            tree.insert(v);
+            ref.insert(v);
+        }
+    }
+
+    for (int k = -2; k <= K + 2; ++k) {  // probe present AND absent keys, incl. ends
+        auto it = tree.find(k);
+        bool present = ref.count(k) > 0;
+        if (!present) {
+            ASSERT_TRUE(it == tree.end());
+            continue;
+        }
+        ASSERT_TRUE(it != tree.end());
+        ASSERT_EQ(*it, k);  // iterator points at the value itself
+
+        std::vector<int> got;
+        for (auto j = it; j != tree.end(); ++j) got.push_back(*j);
+        std::vector<int> want(ref.lower_bound(k), ref.end());
+        ASSERT_TRUE(got == want);
+    }
+}
+
+// A moved-from POPULATED tree must remain a usable, empty tree. Its SlabPools
+// hand their real (heap-backed) slabs to the destination but retain their
+// size/align configuration, so the source can allocate fresh slabs and be
+// filled again from scratch. (test_move_empty_tree only moves an already-empty
+// source, and test_self_move_assignment is a no-op self-move -- neither drives
+// re-population of a genuinely emptied-out pool.)
+TEST(test_reuse_populated_tree_after_move) {
+    BTree<int, 4> src;
+    for (int i = 0; i < 200; ++i) src.insert(i);
+    ASSERT_EQ(src.size(), 200u);
+
+    // Move-construct: contents transfer wholesale to dst.
+    BTree<int, 4> dst(std::move(src));
+    ASSERT_EQ(dst.size(), 200u);
+    for (int i = 0; i < 200; ++i) ASSERT_TRUE(dst.search(i));
+
+    // Source is now empty AND reusable with a fresh, disjoint key set.
+    ASSERT_TRUE(src.empty());
+    ASSERT_EQ(src.size(), 0u);
+    ASSERT_EQ(src.height(), 0u);
+    for (int i = 1000; i < 1300; ++i) src.insert(i);
+    ASSERT_EQ(src.size(), 300u);
+    for (int i = 1000; i < 1300; ++i) ASSERT_TRUE(src.search(i));
+    ASSERT_FALSE(src.search(0));  // never received the moved-away contents
+
+    // Move-assign onto a populated destination: dst frees its own nodes, adopts
+    // src2's storage, and src2 is likewise left reusable.
+    BTree<int, 4> src2;
+    for (int i = 0; i < 150; ++i) src2.insert(i * 2);
+    dst = std::move(src2);
+    ASSERT_EQ(dst.size(), 150u);
+    for (int i = 0; i < 150; ++i) ASSERT_TRUE(dst.search(i * 2));
+    ASSERT_FALSE(dst.search(1));  // dst's prior contents were released
+    ASSERT_TRUE(src2.empty());
+    src2.insert(999);
+    ASSERT_EQ(src2.size(), 1u);
+    ASSERT_TRUE(src2.search(999));
+}
+
+// A tree built entirely from ONE repeated key: every split median is that key
+// and every internal separator equals it, so a tall order-3 tree has the same
+// value at every level. Removing the copies one at a time drives remove_rec's
+// predecessor swap with predecessor == separator == key at each level, plus
+// underflow repair (borrow/merge) across all-identical nodes. Size must fall by
+// exactly one per removal and the key stay findable until the last copy is gone.
+TEST(test_all_identical_insert_remove) {
+    const int M = 400;
+    BTree<int, 3> tree;
+    for (int i = 0; i < M; ++i) tree.insert(7);
+    ASSERT_EQ(tree.size(), static_cast<size_t>(M));
+    ASSERT_TRUE(tree.search(7));
+    ASSERT_EQ(tree.min(), 7);
+    ASSERT_EQ(tree.max(), 7);
+    ASSERT_TRUE(tree.height() > 1u);  // genuinely multi-level, not a single leaf
+
+    long count = 0;
+    for (int v : tree) { ASSERT_EQ(v, 7); ++count; }
+    ASSERT_EQ(count, static_cast<long>(M));
+
+    for (int i = 0; i < M; ++i) {
+        ASSERT_TRUE(tree.search(7));
+        ASSERT_TRUE(tree.remove(7));
+        ASSERT_EQ(tree.size(), static_cast<size_t>(M - 1 - i));
+    }
+    ASSERT_TRUE(tree.empty());
+    ASSERT_FALSE(tree.search(7));
+    ASSERT_FALSE(tree.remove(7));  // removing from an empty tree is a no-op false
+}
+
 // === remove() strong exception-safety ===
 
 // Key type whose COPY can be made to throw on demand, but whose MOVE is noexcept
@@ -2906,6 +3091,13 @@ int main() {
     RUN_TEST(test_get_successor_shapes);
     RUN_TEST(test_height_stable_after_removes);
     RUN_TEST(test_order_5_min_keys_boundary);
+
+    // Duplicate-heavy coverage: differential vs std::multiset, leftmost-find
+    // half-open range, moved-from reuse, and all-identical-key churn.
+    RUN_TEST(test_multiset_differential_stress);
+    RUN_TEST(test_find_halfopen_range_duplicates);
+    RUN_TEST(test_reuse_populated_tree_after_move);
+    RUN_TEST(test_all_identical_insert_remove);
 
     std::cout << std::endl;
     std::cout << "=== Results ===" << std::endl;
