@@ -44,6 +44,12 @@ tree.insert(10);
 tree.insert(20);
 tree.insert(5);
 
+// Bulk-load from existing data in one bottom-up pass (much faster than
+// inserting element by element; see the benchmarks below)
+std::vector<int> data = {9, 3, 7, 1, 8, 2};
+BTree<int> built(data.begin(), data.end());
+BTree<int> braced{5, 3, 9, 1, 7};  // from an initializer list
+
 // Search for values
 if (tree.search(10)) {
     std::cout << "Found 10" << std::endl;
@@ -94,7 +100,7 @@ Compile and run the test suite:
 g++ -std=c++17 -Wall -Wextra -o btree_test btree_test.cpp && ./btree_test
 ```
 
-The test suite includes 121 tests organized into the following categories:
+The test suite includes 124 tests organized into the following categories:
 
 ### Basic Operations (19 tests)
 - Empty tree behavior and state transitions
@@ -154,7 +160,7 @@ The test suite includes 121 tests organized into the following categories:
 - STL algorithm compatibility (std::find, std::count)
 - find() method returning iterator
 
-### Additional Tests (58 tests)
+### Additional Tests (61 tests)
 - Move semantics edge cases (self-move, empty tree move, reuse after move)
 - Height verification and growth patterns
 - Min/max through modifications
@@ -170,6 +176,10 @@ The test suite includes 121 tests organized into the following categories:
 - Move-aware `insert(T&&)`: an rvalue key is relocated into its leaf with zero
   copies (proven with a copy/move-counting key type), while the lvalue overload
   still copies and leaves the caller's object intact
+- Bulk-load range/`initializer_list` constructor: differential vs a sorted
+  reference across sizes 0–5000 and orders 3–100 (random, already-sorted, and
+  duplicate-heavy inputs), full teardown-by-remove to prove structural balance,
+  and leftmost-`find` correctness over a bulk-loaded tree with duplicates
 
 ## Running Benchmarks
 
@@ -179,7 +189,7 @@ Compile and run the benchmark suite:
 g++ -std=c++17 -O2 -o btree_benchmark btree_benchmark.cpp && ./btree_benchmark
 ```
 
-The benchmark compares BTree performance against `std::set` across different tree orders (3, 10, 50, 64, 100) and data sizes (10K, 100K, 1M elements). Operations tested include insert, search, find, iteration, and remove.
+The benchmark compares BTree performance against `std::set` across different tree orders (3, 10, 50, 64, 100) and data sizes (10K, 100K, 1M elements). Operations tested include insert, bulk-load construction (from random and from already-sorted data), search, find, iteration, and remove.
 
 You can specify custom sizes via command line:
 
@@ -193,17 +203,20 @@ Measured at **1,000,000 elements**, compiled with `g++ -O2` (GCC 16, Windows). V
 
 | Operation            | Order 3 | Order 10 | Order 50 | Order 64 (default) | Order 100 | `std::set` |
 |----------------------|--------:|---------:|---------:|-------------------:|----------:|-----------:|
-| insert (random)      |   408   |    113   |     90   |         99         |    114    |    503     |
-| insert (sequential)  |    74   |     19   |    9.4   |        8.7         |    8.2    |     —      |
-| search               |   452   |    131   |     90   |         88         |    109    |    630     |
-| find (iterator)      |   491   |    145   |    101   |        101         |    117    |    615     |
-| iterate (full scan)  |    23   |    4.6   |    2.3   |        2.2         |    2.1    |    109     |
-| remove (random)      |   548   |    172   |    102   |        116         |    124    |    745     |
+| insert (random)      |   348   |     98   |     78   |         84         |     98    |    426     |
+| insert (sequential)  |    63   |     16   |    7.4   |        7.1         |    6.6    |     —      |
+| bulk-load (random)   |    65   |     59   |     59   |         59         |     59    |     —      |
+| bulk-load (sorted)   |   9.8   |    4.8   |    4.3   |        4.3         |    3.7    |     —      |
+| search               |   394   |    108   |     77   |         79         |     88    |    543     |
+| find (iterator)      |   501   |    126   |     79   |         81         |     95    |    545     |
+| iterate (full scan)  |    23   |    4.3   |    2.0   |        1.9         |    1.8    |    102     |
+| remove (random)      |   472   |    144   |     93   |         93         |    103    |    653     |
 
 Takeaways:
-- **Default order 64 vs `std::set` at 1M:** ~5× faster to build, ~7× faster to search, ~6× faster to find/remove, and **~51× faster** to iterate in sorted order — inline, contiguous keys make both the descent and the full scan far more cache-friendly than pointer-chasing a red-black tree.
+- **Default order 64 vs `std::set` at 1M:** ~5× faster to build, ~7× faster to search, ~7× faster to find/remove, and **~55× faster** to iterate in sorted order — inline, contiguous keys make both the descent and the full scan far more cache-friendly than pointer-chasing a red-black tree.
+- **Bulk-load is the fastest way to build a tree.** The `BTree(first, last)` constructor sorts once (cache-friendly) then assembles the tree bottom-up with sequential writes, skipping a million separate root-to-leaf descents. From **random** data it is 1.3–5.4× faster than element-wise `insert` (the win is largest at low orders, where per-insert descent cost dominates). From **already-sorted** data an `is_sorted` fast-path skips the sort, so a 1M-element tree is built in **under 5 ms** at the larger orders — ~20× faster than random `insert` and faster even than the O(1)-append sequential-insert path.
 - **Higher orders are faster, up to a sweet spot around 50–100.** Larger nodes mean a shallower tree and fewer cache misses; a branchless in-node key scan keeps per-node work cheap even at order 100. Order 3 is the slowest (deepest tree, most per-node overhead) but is correct and still comfortably beats `std::set`.
-- **Sequential insertion is nearly free** thanks to an O(1) append fast-path (a sorted-order bulk load of 1M ints takes <10 ms at the larger orders).
+- **Sequential insertion is nearly free** thanks to an O(1) append fast-path; if you already hold the data, the bulk-load constructor is faster still.
 - **Versus the previous `std::vector`-per-node implementation** (same machine, same benchmark): roughly **3× faster** across the board at order 3 and **1.3–1.7×** at order 100, with the largest gains from the single-allocation inline node layout and the branchless in-node search.
 
 ## Implementation notes
@@ -232,6 +245,14 @@ data layout and inner loops are tuned for cache and branch behavior:
 - **Allocation-free iterators.** The iterator's traversal stack lives inline
   (spilling to the heap only for pathologically deep trees), so `find()` and
   `begin()` do no heap allocation.
+- **Bottom-up bulk load.** The range/`initializer_list` constructor sorts the
+  input once (skipped when it is already sorted) and then builds the tree one
+  level at a time from the bottom, packing each node to the fullest fill the
+  `[min_keys, max_keys]` invariant allows and pulling one key out between
+  adjacent nodes as their parent separator. This replaces `n` independent
+  root-to-leaf descents with a single sequential-write pass, and produces the
+  shallowest legal tree. Keys are *moved* out of the sorted buffer into their
+  final slots, so no key is copied during the build.
 
 The default order is **64**, a cache-line-friendly fan-out in the measured sweet
 spot; any order `>= 3` remains supported and correct.
@@ -243,6 +264,14 @@ spot; any order `>= 3` remains supported and correct.
 Template parameters:
 - `T` - Key type (must support comparison operators)
 - `Order` - B-tree order (default: 64)
+
+#### Construction
+| Constructor | Complexity | Description |
+|-------------|------------|-------------|
+| `BTree()` | O(1) | Empty tree |
+| `BTree(InputIt first, InputIt last)` | O(n log n), or O(n) if already sorted | Bulk-load from a range: sort once, then build bottom-up (much faster than element-wise insertion — see [benchmarks](#sample-results)) |
+| `BTree(std::initializer_list<T>)` | O(n log n) | Bulk-load from a braced list, e.g. `BTree<int>{3, 1, 4, 1, 5}` |
+| `BTree(BTree&&)` | O(1) | Move constructor (copy is disabled) |
 
 #### Core Methods
 | Method | Complexity | Description |

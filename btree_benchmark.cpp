@@ -105,6 +105,25 @@ BenchmarkResult benchmark_insert_sequential(const std::vector<int>& data) {
     return {"BTree<" + std::to_string(Order) + "> insert sequential", best_ms, data.size()};
 }
 
+// Benchmark bulk-load construction from a range (sort once + build bottom-up),
+// versus the per-element insert benchmarks above.
+template<int Order>
+BenchmarkResult benchmark_bulk_load(const std::vector<int>& data) {
+    double best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < NUM_RUNS; run++) {
+        Timer timer;
+        BTree<int, Order> tree(data.begin(), data.end());
+        double elapsed = timer.elapsed_ms();
+        volatile size_t s = tree.size();  // keep the construction from being elided
+        (void)s;
+        if (run == 0) continue;  // Skip first run (warmup)
+        if (elapsed < best_ms) {
+            best_ms = elapsed;
+        }
+    }
+    return {"BTree<" + std::to_string(Order) + "> bulk-load", best_ms, data.size()};
+}
+
 // Benchmark search operation (runs multiple times, returns best)
 template<int Order>
 BenchmarkResult benchmark_search(BTree<int, Order>& tree, const std::vector<int>& queries) {
@@ -291,6 +310,15 @@ void run_benchmarks_for_order(size_t /*n*/, const std::vector<int>& random_data,
     // Insert benchmarks
     print_result(benchmark_insert_random<Order>(random_data));
     print_result(benchmark_insert_sequential<Order>(seq_data));
+
+    // Bulk-load construction (range constructor): from random data (sort + build)
+    // and from already-sorted data (build only, via the is_sorted fast-path).
+    print_result(benchmark_bulk_load<Order>(random_data));
+    {
+        BenchmarkResult r = benchmark_bulk_load<Order>(seq_data);
+        r.name = "BTree<" + std::to_string(Order) + "> bulk-load sorted";
+        print_result(r);
+    }
 
     // Build tree for search/iterate benchmarks
     BTree<int, Order> tree;

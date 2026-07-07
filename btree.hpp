@@ -10,6 +10,8 @@
 #include <new>
 #include <type_traits>
 #include <utility>
+#include <iterator>
+#include <initializer_list>
 
 // B-tree implementation with configurable order (any Order >= 3).
 //
@@ -829,6 +831,130 @@ private:
         size_++;
     }
 
+    // Bulk-load the tree from an already-sorted sequence of keys (moved out of
+    // `keys`), building bottom-up so the whole structure is created with
+    // sequential writes and no per-key root-to-leaf descent. Produces a valid,
+    // balanced B-tree: leaves are packed to the fullest fill that still keeps
+    // every node within [min_keys, max_keys] (the root may hold fewer, as the
+    // invariants allow), so the tree is as shallow as possible.
+    //
+    // The keys interleave with the separators that live in parent nodes:
+    //   [leaf 0 keys] s0 [leaf 1 keys] s1 ... s(L-2) [leaf L-1 keys]
+    // so L leaves consume L-1 keys as separators; the same pattern repeats one
+    // level up over the L leaves. Choosing L = ceil((n+1)/Order) guarantees each
+    // leaf gets between min_keys and max_keys keys (and likewise every internal
+    // node gets between min_keys+1 and max_keys+1 children), for every Order>=3.
+    //
+    // Precondition: the tree is empty and `keys` is sorted non-descending. The
+    // only step here that can throw is a node allocation (bad_alloc); on any
+    // throw every node allocated so far is freed and the tree is left empty, so
+    // nothing leaks. Key moves are noexcept (BTree requires nothrow-move T).
+    void build_from_sorted(std::vector<T> keys) {
+        const std::size_t n = keys.size();
+        if (n == 0) {
+            return;  // tree stays empty
+        }
+
+        const std::size_t Ord = static_cast<std::size_t>(Order);
+        // Minimal #leaves = ceil((n+1)/Order); the "+1" reserves the L-1 keys
+        // that become separators in the parent level rather than leaf keys.
+        std::size_t L = (n + Ord) / Ord;  // == ceil((n + 1) / Order)
+
+        // Track every allocated node so a mid-build bad_alloc frees them all. The
+        // finished tree has < 2*L nodes (each level shrinks by >= min_keys+1 >= 2),
+        // so this reservation never grows and the push_back below cannot throw and
+        // orphan a freshly allocated node.
+        std::vector<Node*> allocated;
+        allocated.reserve(2 * L + 16);
+
+        auto alloc = [&](bool leaf) -> Node* {
+            Node* nd = make_node(leaf);  // may throw bad_alloc
+            allocated.push_back(nd);
+            return nd;
+        };
+
+        try {
+            // --- Leaf level: distribute n-(L-1) keys across L leaves, taking the
+            // key that falls between two leaves as their separator. ---
+            const std::size_t leaf_keys = n - (L - 1);
+            const std::size_t base = leaf_keys / L;
+            const std::size_t rem = leaf_keys % L;  // first `rem` leaves get +1
+
+            std::vector<Node*> level;
+            level.reserve(L);
+            std::vector<T> seps;
+            if (L > 1) seps.reserve(L - 1);
+
+            std::size_t pos = 0;
+            for (std::size_t li = 0; li < L; ++li) {
+                std::size_t g = base + (li < rem ? 1 : 0);
+                Node* leaf = alloc(true);
+                for (std::size_t k = 0; k < g; ++k) {
+                    leaf->keys.push_back(std::move(keys[pos++]));
+                }
+                level.push_back(leaf);
+                if (li + 1 < L) {
+                    seps.push_back(std::move(keys[pos++]));
+                }
+            }
+
+            std::size_t h = 1;  // levels built so far (leaves are level 1)
+
+            // --- Internal levels: group M children (with M-1 separators) into
+            // P = ceil(M/Order) parents. A parent with c children stores its c-1
+            // interior separators as keys; one further separator between adjacent
+            // parents is promoted to the next round. ---
+            while (level.size() > 1) {
+                const std::size_t M = level.size();
+                const std::size_t P = (M + Ord - 1) / Ord;  // ceil(M / Order)
+                const std::size_t cbase = M / P;
+                const std::size_t crem = M % P;  // first `crem` parents get +1 child
+
+                std::vector<Node*> parent;
+                parent.reserve(P);
+                std::vector<T> psep;
+                if (P > 1) psep.reserve(P - 1);
+
+                std::size_t ci = 0;  // index into level (children)
+                std::size_t si = 0;  // index into seps
+                for (std::size_t p = 0; p < P; ++p) {
+                    std::size_t c = cbase + (p < crem ? 1 : 0);
+                    Node* in = alloc(false);
+                    for (std::size_t k = 0; k < c; ++k) {
+                        ch(in).push_back(level[ci++]);
+                        if (k + 1 < c) {
+                            in->keys.push_back(std::move(seps[si++]));
+                        }
+                    }
+                    parent.push_back(in);
+                    if (p + 1 < P) {
+                        psep.push_back(std::move(seps[si++]));  // promote separator
+                    }
+                }
+
+                level = std::move(parent);
+                seps = std::move(psep);
+                ++h;
+            }
+
+            root = level[0];
+            size_ = n;
+            height_ = h;
+        } catch (...) {
+            // free_one runs each node's true-type destructor (releasing any
+            // moved-in separator keys) and returns the block to its pool. Child
+            // pointers are not followed, so freeing every allocated node exactly
+            // once is correct and cannot double-free.
+            for (Node* nd : allocated) {
+                free_one(nd);
+            }
+            root = nullptr;
+            size_ = 0;
+            height_ = 0;
+            throw;
+        }
+    }
+
     Node* search_node(Node* node, const T& key) const {
         // Search for key position
         size_t i = lower_index(node->keys.begin(), node->keys.size(), key);
@@ -1136,6 +1262,34 @@ public:
         }
         return *this;
     }
+
+    // Bulk-load constructor: build the tree from the range [first, last) in one
+    // bottom-up pass -- sort the keys once (cache-friendly), then assemble the
+    // leaves and internal levels with sequential writes -- instead of performing
+    // `last - first` separate O(log n) inserts, each of which chases a fresh
+    // root-to-leaf path. This makes constructing a tree from existing data
+    // substantially faster (see the benchmark's "bulk-load" row). Duplicate keys
+    // are supported (multiset semantics). Enabled only for genuine input
+    // iterators (SFINAE) so it never hijacks other constructor calls.
+    template <typename InputIt,
+              typename = std::enable_if_t<std::is_convertible_v<
+                  typename std::iterator_traits<InputIt>::iterator_category,
+                  std::input_iterator_tag>>>
+    BTree(InputIt first, InputIt last) : BTree() {
+        std::vector<T> buf(first, last);  // gather (may throw: tree still empty)
+        // Skip the sort when the input already arrives sorted (a common case:
+        // loading from a sorted file/column/prior tree). is_sorted is a single
+        // O(n) pass that bails at the first out-of-order pair, so it costs
+        // essentially nothing on unsorted input but turns an already-sorted
+        // bulk-load into a pure O(n) build.
+        if (!std::is_sorted(buf.begin(), buf.end())) {
+            std::sort(buf.begin(), buf.end());  // may throw: tree still empty
+        }
+        build_from_sorted(std::move(buf));
+    }
+
+    // Bulk-load from a braced list, e.g. BTree<int> t{3, 1, 4, 1, 5};
+    BTree(std::initializer_list<T> init) : BTree(init.begin(), init.end()) {}
 
     // O(log n) - Insert a key into the tree by copying it.
     void insert(const T& key) { insert_impl(key); }

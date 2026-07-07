@@ -3005,6 +3005,113 @@ TEST(test_insert_lvalue_preserves_source) {
     ASSERT_TRUE(tree.search(std::string("moved-in-string")));
 }
 
+// === Bulk-load range constructor: BTree(first, last) / initializer_list ===
+//
+// A bulk-loaded tree must be a fully valid B-tree: the same multiset of keys in
+// sorted in-order, every key findable, and -- crucially -- structurally sound
+// enough that a full teardown-by-remove of every element succeeds (which only
+// holds if every non-root node was built within [min_keys, max_keys]). We can't
+// see node fill factors through the public API, so removing every element and
+// confirming the tree empties cleanly is the structural-validity proxy.
+template <int Order>
+static void bulk_load_check(const std::vector<int>& input) {
+    std::vector<int> sorted = input;
+    std::sort(sorted.begin(), sorted.end());
+
+    BTree<int, Order> tree(input.begin(), input.end());
+
+    ASSERT_EQ(tree.size(), input.size());
+
+    std::vector<int> got;
+    for (int v : tree) got.push_back(v);
+    ASSERT_TRUE(got == sorted);  // exact multiset + order match
+
+    for (int v : input) ASSERT_TRUE(tree.search(v));
+
+    if (input.empty()) {
+        ASSERT_TRUE(tree.empty());
+        ASSERT_EQ(tree.height(), static_cast<size_t>(0));
+    } else {
+        ASSERT_TRUE(tree.height() >= 1);
+        // Height must be genuinely logarithmic (a balanced build), not a
+        // degenerate chain: comfortably bounded by 2*log_{min+1}(n) + 2.
+        size_t branch = static_cast<size_t>((Order - 1) / 2) + 1;  // min_keys+1
+        if (branch < 2) branch = 2;
+        size_t bound = 2;
+        size_t cap = 1;
+        while (cap < input.size()) { cap *= branch; ++bound; }
+        ASSERT_TRUE(tree.height() <= bound + 2);
+    }
+
+    // Structural soundness: removing every element (each occurrence once) must
+    // succeed and leave the tree empty, exercising borrow/merge over the built
+    // shape. Remove in a shuffled order to stress rebalancing paths.
+    std::vector<int> order = input;
+    std::mt19937 rng(99);
+    std::shuffle(order.begin(), order.end(), rng);
+    for (int v : order) ASSERT_TRUE(tree.remove(v));
+    ASSERT_TRUE(tree.empty());
+    ASSERT_EQ(tree.size(), static_cast<size_t>(0));
+}
+
+// Bulk load must produce a correct, balanced tree across many sizes and orders,
+// including the boundary sizes (0,1,2,3) and the smallest order (3), and for
+// random, already-sorted, and duplicate-heavy inputs. Fails to compile before
+// the BTree(first,last) constructor exists; passes once it does.
+TEST(test_bulk_load_range_constructor) {
+    std::mt19937 rng(2024);
+    for (size_t n : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(4),
+                     size_t(5), size_t(7), size_t(10), size_t(50), size_t(100),
+                     size_t(257), size_t(1000), size_t(5000)}) {
+        std::vector<int> data(n);
+        for (size_t i = 0; i < n; ++i) data[i] = static_cast<int>(rng() % 100000);
+        bulk_load_check<3>(data);
+        bulk_load_check<4>(data);
+        bulk_load_check<5>(data);
+        bulk_load_check<7>(data);
+        bulk_load_check<64>(data);
+        bulk_load_check<100>(data);
+
+        std::vector<int> s = data;
+        std::sort(s.begin(), s.end());
+        bulk_load_check<3>(s);
+        bulk_load_check<64>(s);
+
+        std::vector<int> dup(n);
+        for (size_t i = 0; i < n; ++i) dup[i] = static_cast<int>(rng() % 5);
+        bulk_load_check<3>(dup);
+        bulk_load_check<6>(dup);
+        bulk_load_check<64>(dup);
+    }
+}
+
+// The initializer_list constructor sorts and de-interleaves duplicates.
+TEST(test_bulk_load_initializer_list) {
+    BTree<int, 5> t{5, 3, 9, 1, 7, 3, 8, 2};
+    std::vector<int> got;
+    for (int v : t) got.push_back(v);
+    std::vector<int> exp{1, 2, 3, 3, 5, 7, 8, 9};
+    ASSERT_TRUE(got == exp);
+    ASSERT_EQ(t.size(), static_cast<size_t>(8));
+    ASSERT_TRUE(t.find(3) != t.end());
+    ASSERT_FALSE(t.search(4));
+}
+
+// find() on a bulk-loaded tree must still return the LEFTMOST duplicate: a
+// separator key equal to values in an adjacent leaf must not shadow them.
+TEST(test_bulk_load_find_leftmost_duplicate) {
+    std::vector<int> data;
+    for (int i = 0; i < 200; ++i) data.push_back(i % 10);  // 20 each of 0..9
+    BTree<int, 4> t(data.begin(), data.end());
+    for (int k = 0; k < 10; ++k) {
+        auto it = t.find(k);
+        ASSERT_TRUE(it != t.end());
+        int count = 0;
+        while (it != t.end() && *it == k) { ++count; ++it; }
+        ASSERT_EQ(count, 20);  // saw every occurrence starting from the first
+    }
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -3170,6 +3277,11 @@ int main() {
     // Move-aware insert(T&&): rvalue keys are relocated, not copied.
     RUN_TEST(test_insert_rvalue_moves_not_copies);
     RUN_TEST(test_insert_lvalue_preserves_source);
+
+    // Bulk-load range/initializer_list constructor.
+    RUN_TEST(test_bulk_load_range_constructor);
+    RUN_TEST(test_bulk_load_initializer_list);
+    RUN_TEST(test_bulk_load_find_leftmost_duplicate);
 
     std::cout << std::endl;
     std::cout << "=== Results ===" << std::endl;
