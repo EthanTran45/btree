@@ -3236,6 +3236,34 @@ TEST(test_count_single_descent) {
     ASSERT_TRUE(count_total * 10 <= find_total * 14);  // count comparisons <= 1.4x find
 }
 
+// equal_range() of an ABSENT key needs only one descent: when the key is not
+// present, lower_bound == upper_bound, so the second descent is redundant. The
+// tree here holds only even values and we query in-range odd values (each falls
+// between two evens, forcing a full descent, not a cheap boundary short-circuit).
+// A two-descent equal_range runs at ~2x a single find on these; the short-circuit
+// brings it to ~1x, so this fails before the change and passes after.
+TEST(test_equal_range_absent_single_descent) {
+    const int N = 40000;
+    std::vector<CmpCounter> data;
+    data.reserve(N);
+    for (int i = 0; i < N; ++i) data.emplace_back(2 * i);  // evens: 0,2,4,...
+    BTree<CmpCounter, 32> tree(data.begin(), data.end());
+
+    long find_total = 0, er_total = 0;
+    for (int i = 0; i < 500; ++i) {
+        CmpCounter probe(2 * (i * 7 % N) + 1);  // odd -> absent, but in range
+        CmpCounter::cmps = 0;
+        (void)tree.find(probe);
+        find_total += CmpCounter::cmps;
+        CmpCounter::cmps = 0;
+        auto er = tree.equal_range(probe);
+        ASSERT_TRUE(er.first == er.second);  // absent -> empty range
+        er_total += CmpCounter::cmps;
+    }
+    ASSERT_TRUE(find_total > 0 && er_total > 0);
+    ASSERT_TRUE(er_total * 10 <= find_total * 14);  // <= 1.4x find (was ~2x)
+}
+
 int main() {
     std::cout << "=== BTree Unit Tests ===" << std::endl << std::endl;
 
@@ -3411,6 +3439,7 @@ int main() {
     RUN_TEST(test_range_queries_differential);
     RUN_TEST(test_count_is_sublinear);
     RUN_TEST(test_count_single_descent);
+    RUN_TEST(test_equal_range_absent_single_descent);
 
     std::cout << std::endl;
     std::cout << "=== Results ===" << std::endl;

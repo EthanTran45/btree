@@ -109,7 +109,7 @@ Compile and run the test suite:
 g++ -std=c++17 -Wall -Wextra -o btree_test btree_test.cpp && ./btree_test
 ```
 
-The test suite includes 127 tests organized into the following categories:
+The test suite includes 128 tests organized into the following categories:
 
 ### Basic Operations (19 tests)
 - Empty tree behavior and state transitions
@@ -169,7 +169,7 @@ The test suite includes 127 tests organized into the following categories:
 - STL algorithm compatibility (std::find, std::count)
 - find() method returning iterator
 
-### Additional Tests (64 tests)
+### Additional Tests (65 tests)
 - Move semantics edge cases (self-move, empty tree move, reuse after move)
 - Height verification and growth patterns
 - Min/max through modifications
@@ -192,9 +192,10 @@ The test suite includes 127 tests organized into the following categories:
 - Range queries (`lower_bound`/`upper_bound`/`equal_range`/`count`): differential
   vs `std::multiset` across orders and duplicate-heavy inputs (present, absent,
   and out-of-range keys), plus comparison-counting key types proving `count()`
-  is sublinear (not an O(n) scan) and reaches its answer in a single descent
-  (its comparison work stays within ~1.4× of a single `find`, versus ~1.9× for a
-  two-descent implementation)
+  reaches its answer in a single descent (its comparison work stays within ~1.4×
+  of a single `find`, versus ~1.9× for a two-descent implementation), and that
+  `equal_range()` of an absent key likewise costs only one descent (no redundant
+  `upper_bound` pass when `lower_bound == upper_bound`)
 
 ## Running Benchmarks
 
@@ -231,7 +232,7 @@ Measured at **1,000,000 elements**, compiled with `g++ -O2` (GCC 16, Windows). V
 Takeaways:
 - **Default order 64 vs `std::set` at 1M:** ~5× faster to build, ~7× faster to search, ~7× faster to find/remove, and **~55× faster** to iterate in sorted order — inline, contiguous keys make both the descent and the full scan far more cache-friendly than pointer-chasing a red-black tree.
 - **Bulk-load is the fastest way to build a tree.** The `BTree(first, last)` constructor sorts once (cache-friendly) then assembles the tree bottom-up with sequential writes, skipping a million separate root-to-leaf descents. From **random** data it is 1.3–5.4× faster than element-wise `insert` (the win is largest at low orders, where per-insert descent cost dominates). From **already-sorted** data an `is_sorted` fast-path skips the sort, so a 1M-element tree is built in **under 5 ms** at the larger orders — ~20× faster than random `insert` and faster even than the O(1)-append sequential-insert path.
-- **Range queries are logarithmic.** `count(key)` descends the tree once (following one child per level like `search`, only fanning out across the equal run once it is found), so it stays cheap even on a million elements — **~5.7× faster than `std::set::count`** at order 64, and only ~1.2× the cost of a single `search` — instead of the O(n) full scan you would otherwise write.
+- **Range queries are logarithmic.** `count(key)` descends the tree once (following one child per level like `search`, only fanning out across the equal run once it is found), so it stays cheap even on a million elements — **~5.7× faster than `std::set::count`** at order 64, and only ~1.2× the cost of a single `search` — instead of the O(n) full scan you would otherwise write. `equal_range(key)` likewise skips its second (`upper_bound`) descent when the key is absent, since the range is then empty.
 - **Higher orders are faster, up to a sweet spot around 50–100.** Larger nodes mean a shallower tree and fewer cache misses; a branchless in-node key scan keeps per-node work cheap even at order 100. Order 3 is the slowest (deepest tree, most per-node overhead) but is correct and still comfortably beats `std::set`.
 - **Sequential insertion is nearly free** thanks to an O(1) append fast-path; if you already hold the data, the bulk-load constructor is faster still.
 - **Versus the previous `std::vector`-per-node implementation** (same machine, same benchmark): roughly **3× faster** across the board at order 3 and **1.3–1.7×** at order 100, with the largest gains from the single-allocation inline node layout and the branchless in-node search.

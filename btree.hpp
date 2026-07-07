@@ -1462,8 +1462,17 @@ public:
     // O(log n) - The half-open range [lower_bound(key), upper_bound(key)) that
     // spans exactly the occurrences of `key`. Iterating it yields count(key)
     // elements, all equal to `key` (empty range if `key` is absent).
+    //
+    // When `key` is absent, lower_bound == upper_bound, so the second descent is
+    // redundant: return the empty range from the single lower_bound descent. Only
+    // when `key` is actually present (its lower_bound points at an equal element)
+    // do we pay the second descent for the true upper_bound.
     [[nodiscard]] std::pair<iterator, iterator> equal_range(const T& key) const {
-        return {bound_impl(key, /*upper=*/false), bound_impl(key, /*upper=*/true)};
+        iterator lo = bound_impl(key, /*upper=*/false);
+        if (lo.current_ == nullptr || !(*lo.current_ == key)) {
+            return {lo, lo};  // key absent -> empty [lower, lower) == [lower, upper)
+        }
+        return {lo, bound_impl(key, /*upper=*/true)};
     }
 
     // O(log n + k) - Number of occurrences of `key` (k = that count). A single
