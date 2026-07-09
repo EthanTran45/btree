@@ -634,7 +634,13 @@ public:
             }
         }
 
-        void advance() noexcept {
+        // Not noexcept: push_left_path -> PathStack::push allocates once the
+        // traversal stack spills past its inline capacity (a tree deeper than
+        // kInline levels), so this can throw std::bad_alloc. Declaring it (or its
+        // callers operator++/begin) noexcept would turn that allocation failure
+        // into std::terminate instead of a catchable exception -- the same reason
+        // find_impl/bound_impl and their public wrappers are not noexcept.
+        void advance() {
             while (!stack_.empty()) {
                 StackFrame& frame = stack_.top();
 
@@ -677,12 +683,14 @@ public:
         reference operator*() const noexcept { return *current_; }
         pointer operator->() const noexcept { return current_; }
 
-        iterator& operator++() noexcept {
+        // Not noexcept: advance() (and, for the post-increment, copying a
+        // heap-spilled PathStack) can allocate on a deep tree. See advance().
+        iterator& operator++() {
             advance();
             return *this;
         }
 
-        iterator operator++(int) noexcept {
+        iterator operator++(int) {
             iterator tmp = *this;
             advance();
             return tmp;
@@ -1567,7 +1575,12 @@ public:
 
     // Iterator support - O(log n) for begin(), O(1) for end()
     // Iterator increment is amortized O(1)
-    [[nodiscard]] iterator begin() const noexcept {
+    //
+    // begin()/cbegin() are not noexcept: building the initial left-path stack can
+    // allocate if the tree is deep enough to spill the iterator's inline
+    // PathStack (see iterator::advance). end()/cend() never allocate (empty
+    // stack), so they stay noexcept.
+    [[nodiscard]] iterator begin() const {
         return iterator(root);
     }
 
@@ -1575,7 +1588,7 @@ public:
         return iterator();
     }
 
-    [[nodiscard]] const_iterator cbegin() const noexcept {
+    [[nodiscard]] const_iterator cbegin() const {
         return begin();
     }
 

@@ -164,7 +164,8 @@ BenchmarkResult benchmark_find(BTree<int, Order>& tree, const std::vector<int>& 
     return {"BTree<" + std::to_string(Order) + "> find", best_ms, queries.size()};
 }
 
-// Benchmark count() (range query: two logarithmic descents to the endpoints).
+// Benchmark count() (range query: a single logarithmic descent, fanning out
+// only across the equal run once the key is found).
 template<int Order>
 BenchmarkResult benchmark_count(BTree<int, Order>& tree, const std::vector<int>& queries) {
     double best_ms = std::numeric_limits<double>::max();
